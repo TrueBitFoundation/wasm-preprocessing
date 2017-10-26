@@ -1,0 +1,7 @@
+[package]
+name = "wasm_processor"
+version = "0.1.0"
+authors = ["Sami Mäkelä <mrsmkl@gmail.com>"]
+
+[dependencies]
+wasmparser = "0.13.0"

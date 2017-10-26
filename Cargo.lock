@@ -1,0 +1,14 @@
+[root]
+name = "wasm_processor"
+version = "0.1.0"
+dependencies = [
+ "wasmparser 0.13.0 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[metadata]
+"checksum wasmparser 0.13.0 (registry+https://github.com/rust-lang/crates.io-index)" = "d4f7e04aa41294228673cd741e0fa74815a222271a9c8938c11c79eac3994cfd"
