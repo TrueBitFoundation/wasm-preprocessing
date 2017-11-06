@@ -176,14 +176,43 @@ fn adjust_stack(res : &mut Vec<Inst>, diff : u32, num : u32) {
     res.push(DROP(diff));
 }
 
-fn handle_function(m : &Module, func : &FuncBody) {
+fn is_func(e : &External) -> bool {
+    match *e {
+        External::Function(idx) => {
+            true
+        },
+        _ => false
+    }
+}
+
+fn get_num_imports(m : &Module) -> u32 {
+    match m.import_section() {
+        None => 0,
+        Some(sec) => {
+            let arr = sec.entries();
+            arr.iter().filter(|&x| is_func(x.external())).count() as u32
+        }
+    }
+}
+
+fn get_func_type(m : &Module, sig : u32) -> &FunctionType {
+    match m.type_section().unwrap().types()[sig as usize] {
+        Type::Function(ref t) => t
+    }
+}
+
+fn handle_function(m : &Module, func : &FuncBody, idx : usize) {
     println!("Got function with {:?} ops", func.code().elements().len());
     println!("{:?}", func.code().elements());
+    
+    let sig = m.function_section().unwrap().entries()[idx].type_ref();
+    let ftype = get_func_type(m, sig);
+    // let num_imports = get_num_imports(m);
     
     let mut res : Vec<Inst> = Vec::new();
     let mut stack : Vec<Control> = Vec::new();
     let mut label : u32 = 0;
-    let mut ptr : u32 = func.locals().len() as u32;
+    let mut ptr : u32 = (func.locals().len() + ftype.params().len()) as u32;
     let mut bptr : u32 = 0;
     for op in func.code().elements().iter() {
         match *op {
@@ -205,7 +234,7 @@ fn handle_function(m : &Module, func : &FuncBody) {
                 res.push(LABEL(start_label));
             },
             End => {
-                if (stack.len() == 0) { break; }
+                if stack.len() == 0 { break; }
                 let c : Control = stack.pop().unwrap();
                 ptr = c.level;
                 bptr = bptr - 1;
@@ -309,8 +338,8 @@ fn main() {
     println!("Function signatures in wasm file: {}", module.function_section().unwrap().entries().len());
     
     // so we do not have parameters here, have to the get them from elsewhere?
-    for f in code_section.bodies().iter() {
-        handle_function(&module, f);
+    for (idx,f) in code_section.bodies().iter().enumerate() {
+        handle_function(&module, f, idx);
     }
 
 
