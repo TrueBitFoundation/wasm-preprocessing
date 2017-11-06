@@ -201,20 +201,63 @@ fn get_func_type(m : &Module, sig : u32) -> &FunctionType {
     }
 }
 
+fn find_func_type(m : &Module, num : u32) -> &FunctionType {
+    // maybe it is import
+    if num < get_num_imports(m) {
+        let arr = m.import_section().unwrap().entries();
+        let idx = match *arr.iter().filter(|&x| is_func(x.external())).collect::<Vec<&ImportEntry>>()[num as usize].external() {
+            External::Function(idx) => idx,
+            _ => 0,
+        };
+        get_func_type(m, idx)
+    }
+    // find it from sig section
+    else {
+        get_func_type(m, m.function_section().unwrap().entries()[(num - get_num_imports(m)) as usize].type_ref())
+    }
+}
+
+fn num_func_returns(ft : &FunctionType) -> u32 {
+    match ft.return_type() {
+        None => 0,
+        Some(_) => 1,
+    }
+}
+
+fn count_locals(func : &FuncBody) -> u32 {
+    func.locals().iter().fold(0, |sum, x| sum + x.count())
+}
+
 fn handle_function(m : &Module, func : &FuncBody, idx : usize) {
-    println!("Got function with {:?} ops", func.code().elements().len());
-    println!("{:?}", func.code().elements());
-    
     let sig = m.function_section().unwrap().entries()[idx].type_ref();
     let ftype = get_func_type(m, sig);
+    
+    println!("Got function with {:?} ops, {:?} locals and {} params",
+        func.code().elements().len(), count_locals(func), ftype.params().len());
+    // println!("{:?}", func.code().elements());
+    
     // let num_imports = get_num_imports(m);
     
     let mut res : Vec<Inst> = Vec::new();
     let mut stack : Vec<Control> = Vec::new();
     let mut label : u32 = 0;
-    let mut ptr : u32 = (func.locals().len() + ftype.params().len()) as u32;
+    let mut ptr : u32 = count_locals(func) + (ftype.params().len() as u32);
     let mut bptr : u32 = 0;
+    
+    // Construct the function top level frame
+    let end_label = label;
+    label = label + 1;
+    bptr = bptr + 1;
+    let rets = num_func_returns(ftype);
+    stack.push(Control {level: rets, rets: rets, target: end_label});
+
+    // Push default values
+    for i in (1..(count_locals(func) as usize) + ftype.params().len()) {
+        res.push(PUSH(0));
+    }
+    
     for op in func.code().elements().iter() {
+        // println!("handling {}; {:?}", ptr, op);
         match *op {
             Unreachable => res.push(UNREACHABLE),
             Nop => res.push(NOP),
@@ -256,12 +299,63 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) {
                 res.push(LABEL(c.target));
                 stack.push(c);
             },
+            Drop => {
+                ptr = ptr - 1;
+                res.push(DROP(1));
+            },
             
             Br(x) => {
-                let c = &stack[stack.len() - (x as usize)];
+                let c = &stack[stack.len() - (x as usize) - 1];
                 adjust_stack(&mut res, ptr - c.level, c.rets);
                 ptr = ptr - c.rets;
                 res.push(JUMP(c.target));
+            },
+            BrIf(x) => {
+                let c = &stack[stack.len() - (x as usize) - 1];
+                let continue_label =label;
+                let end_label = label+1;
+                label = label+2;
+                res.push(JUMPI(continue_label));
+                res.push(JUMP(end_label));
+                res.push(LABEL(continue_label));
+                adjust_stack(&mut res, ptr - c.level - 1, c.rets);
+                res.push(JUMP(c.target));
+                res.push(LABEL(end_label));
+                ptr = ptr - 1;
+            },
+            Return => {
+                let c = &stack[0];
+                adjust_stack(&mut res, ptr - c.level, c.rets);
+                ptr = ptr - c.rets;
+                res.push(JUMP(c.target));
+            },
+            BrTable(ref tab, def) => {
+                let rets = &stack[stack.len() - (def as usize) - 1].rets;
+                let len = tab.len() as u32;
+                res.push(JUMPFORWARD(len));
+                for i in 0..len {
+                    res.push(JUMP (label+i as u32));
+                }
+                for (i,num) in tab.iter().enumerate() {
+                    let c = &stack[stack.len() - (*num as usize) - 1];
+                    res.push(LABEL(label+i as u32));
+                    adjust_stack(&mut res, ptr - c.level - 1, c.rets);
+                    res.push(JUMP(c.target));
+                }
+                let c = &stack[stack.len() - (def as usize) - 1];
+                res.push(LABEL(label+len as u32));
+                adjust_stack(&mut res, ptr - c.level - 1, c.rets);
+                res.push(JUMP(c.target));
+                
+                ptr = ptr-1-rets;
+                label = label + len + 2;
+            },
+            
+            Call(x) => {
+                let ftype = find_func_type(m, x);
+                // println!("calling {} with type {:?}", x, ftype);
+                res.push(CALL(x));
+                ptr = ptr - (ftype.params().len() as u32) + num_func_returns(ftype)
             },
             
             I32Const(x) => {
@@ -299,11 +393,30 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) {
                 res.push(DROP(1));
                 ptr = ptr - 1;
             },
+            TeeLocal(x) => {
+                res.push(SET(ptr-x));
+            },
             
             I32Load(flag, offset) => {
                 res.push(LOAD {offset, memsize: Size::Mem32, packing:Packing::ZX});
             },
+            I32Load8S(flag, offset) => {
+                res.push(LOAD {offset, memsize: Size::Mem8, packing:Packing::SX});
+            },
+            I32Load8U(flag, offset) => {
+                res.push(LOAD {offset, memsize: Size::Mem8, packing:Packing::ZX});
+            },
             
+            I32Store8(flag, offset) => {
+                res.push(STORE {offset, memsize: Size::Mem8});
+            },
+            I32Store16(flag, offset) => {
+                res.push(STORE {offset, memsize: Size::Mem16});
+            },
+            I32Store(flag, offset) => {
+                res.push(STORE {offset, memsize: Size::Mem32});
+            },
+
             I32Add => {
                 ptr = ptr - 1;
                 res.push(BINOP(0x62));
@@ -312,12 +425,37 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) {
                 ptr = ptr - 1;
                 res.push(BINOP(0x71));
             },
-            F32ConvertSI32 => {
-                res.push(UNOP(0xb2));
+            I32GtS => {
+                ptr = ptr - 1;
+                res.push(BINOP(0x4a));
             },
+            I32LeS => {
+                ptr = ptr - 1;
+                res.push(BINOP(0x4c));
+            }, 
+            I32Shl => {
+                ptr = ptr - 1;
+                res.push(BINOP(0x74));
+            },
+            I32Ne => {
+                ptr = ptr - 1;
+                res.push(BINOP(0x47));
+            },
+            I32Eq => { ptr = ptr - 1; res.push(BINOP(0x46)); },
+            I32Sub => { ptr = ptr - 1; res.push(BINOP(0x6b)); },
+            I32GeS => { ptr = ptr - 1; res.push(BINOP(0x4e)); },
+            I32LtS => { ptr = ptr - 1; res.push(BINOP(0x48)); },
+            I32GtU => { ptr = ptr - 1; res.push(BINOP(0x4b)); },
+            I32ShrS => { ptr = ptr - 1; res.push(BINOP(0x75)); },
+            I32Or => { ptr = ptr - 1; res.push(BINOP(0x72)); },
+            
+            I32Eqz => res.push(UNOP(0x45)),
+                
+            F32ConvertSI32 => res.push(UNOP(0xb2)),
+            F64PromoteF32 => res.push(UNOP(0xbb)),
             
             _ => {
-                println!("at {:?}", op);
+                println!("Unhandled {:?}", op);
             }
         }
     }
@@ -336,6 +474,7 @@ fn main() {
     
     println!("Function count in wasm file: {}", code_section.bodies().len());
     println!("Function signatures in wasm file: {}", module.function_section().unwrap().entries().len());
+    println!("Function imports: {}", get_num_imports(&module));
     
     // so we do not have parameters here, have to the get them from elsewhere?
     for (idx,f) in code_section.bodies().iter().enumerate() {
