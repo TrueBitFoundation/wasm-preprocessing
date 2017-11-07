@@ -20,33 +20,6 @@ use std::collections::HashMap;
 
 // enum for op codes
 
-/*
-
-These can just be binary values?
-
-enum Op<TI32, TI64, TF32, TF64> {
-  I32(TI32),
-  I64(TI64),
-  F32(TF32),
-  F64(TF64),
-}
-
-enum IntUnop = Clz | Ctz | Popcnt
-enum IntBinop = Add | Sub | Mul | DivS | DivU | RemS | RemU
-             | And | Or | Xor | Shl | ShrS | ShrU | Rotl | Rotr
-enum IntTestop = Eqz
-enum IntRelop = Eq | Ne | LtS | LtU | GtS | GtU | LeS | LeU | GeS | GeU
-enum IntCvtop = ExtendSI32 | ExtendUI32 | WrapI64
-             | TruncSF32 | TruncUF32 | TruncSF64 | TruncUF64
-             | ReinterpretFloat
-
-struct LoadOp {
-    
-}
-
-
-*/
-
 enum Size {
     Mem8,
     Mem16,
@@ -250,7 +223,7 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) {
     bptr = bptr + 1;
     let rets = num_func_returns(ftype);
     stack.push(Control {level: rets, rets: rets, target: end_label});
-
+    
     // Push default values
     for i in (1..(count_locals(func) as usize) + ftype.params().len()) {
         res.push(PUSH(0));
@@ -351,11 +324,32 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) {
                 label = label + len + 2;
             },
             
+            Select => {
+                let else_label = label;
+                let end_label = label+1;
+                res.push(JUMPI(else_label));
+                res.push(SET(2));
+                res.push(DROP(1));
+                res.push(JUMP(end_label));
+                res.push(LABEL(else_label));
+                res.push(DROP(1));
+                res.push(LABEL(end_label));
+                
+                label = label+2;
+                ptr = ptr-2;
+            },
+            
             Call(x) => {
                 let ftype = find_func_type(m, x);
                 // println!("calling {} with type {:?}", x, ftype);
                 res.push(CALL(x));
-                ptr = ptr - (ftype.params().len() as u32) + num_func_returns(ftype)
+                ptr = ptr - (ftype.params().len() as u32) + num_func_returns(ftype);
+            },
+            CallIndirect(x,_) => {
+                let ftype = get_func_type(m, x);
+                // res.push(CHECKCALLI(x));
+                res.push(CALLI);
+                ptr = ptr - (ftype.params().len() as u32) + num_func_returns(ftype) - 1;
             },
             
             I32Const(x) => {
@@ -397,6 +391,15 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) {
                 res.push(SET(ptr-x));
             },
             
+            CurrentMemory(_) => {
+                ptr = ptr+1;
+                res.push(CURMEM);
+            },
+            GrowMemory(_) => {
+                ptr = ptr-1;
+                res.push(GROW);
+            },
+            
             I32Load(flag, offset) => {
                 res.push(LOAD {offset, memsize: Size::Mem32, packing:Packing::ZX});
             },
@@ -406,57 +409,209 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) {
             I32Load8U(flag, offset) => {
                 res.push(LOAD {offset, memsize: Size::Mem8, packing:Packing::ZX});
             },
+            I32Load16S(flag, offset) => {
+                res.push(LOAD {offset, memsize: Size::Mem16, packing:Packing::SX});
+            },
+            I32Load16U(flag, offset) => {
+                res.push(LOAD {offset, memsize: Size::Mem16, packing:Packing::ZX});
+            },
             
+            I64Load(flag, offset) => {
+                res.push(LOAD {offset, memsize: Size::Mem64, packing:Packing::ZX});
+            },
+            I64Load8S(flag, offset) => {
+                res.push(LOAD {offset, memsize: Size::Mem8, packing:Packing::SX});
+            },
+            I64Load8U(flag, offset) => {
+                res.push(LOAD {offset, memsize: Size::Mem8, packing:Packing::ZX});
+            },
+            I64Load16S(flag, offset) => {
+                res.push(LOAD {offset, memsize: Size::Mem16, packing:Packing::SX});
+            },
+            I64Load16U(flag, offset) => {
+                res.push(LOAD {offset, memsize: Size::Mem16, packing:Packing::ZX});
+            },
+            I64Load32S(flag, offset) => {
+                res.push(LOAD {offset, memsize: Size::Mem32, packing:Packing::SX});
+            },
+            I64Load32U(flag, offset) => {
+                res.push(LOAD {offset, memsize: Size::Mem32, packing:Packing::ZX});
+            },
+            
+            F32Load(flag, offset) => {
+                res.push(LOAD {offset, memsize: Size::Mem32, packing:Packing::ZX});
+            },
+            F64Load(flag, offset) => {
+                res.push(LOAD {offset, memsize: Size::Mem64, packing:Packing::ZX});
+            },
+            
+            I32Store(flag, offset) => {
+                res.push(STORE {offset, memsize: Size::Mem32});
+            },
             I32Store8(flag, offset) => {
                 res.push(STORE {offset, memsize: Size::Mem8});
             },
             I32Store16(flag, offset) => {
                 res.push(STORE {offset, memsize: Size::Mem16});
             },
-            I32Store(flag, offset) => {
+            
+            I64Store(flag, offset) => {
+                res.push(STORE {offset, memsize: Size::Mem64});
+            },
+            I64Store8(flag, offset) => {
+                res.push(STORE {offset, memsize: Size::Mem8});
+            },
+            I64Store16(flag, offset) => {
+                res.push(STORE {offset, memsize: Size::Mem16});
+            },
+            I64Store32(flag, offset) => {
                 res.push(STORE {offset, memsize: Size::Mem32});
             },
-
-            I32Add => {
-                ptr = ptr - 1;
-                res.push(BINOP(0x62));
+            
+            F32Store(flag, offset) => {
+                res.push(STORE {offset, memsize: Size::Mem32});
             },
-            I32And => {
-                ptr = ptr - 1;
-                res.push(BINOP(0x71));
+            F64Store(flag, offset) => {
+                res.push(STORE {offset, memsize: Size::Mem64});
             },
-            I32GtS => {
-                ptr = ptr - 1;
-                res.push(BINOP(0x4a));
-            },
-            I32LeS => {
-                ptr = ptr - 1;
-                res.push(BINOP(0x4c));
-            }, 
-            I32Shl => {
-                ptr = ptr - 1;
-                res.push(BINOP(0x74));
-            },
-            I32Ne => {
-                ptr = ptr - 1;
-                res.push(BINOP(0x47));
-            },
-            I32Eq => { ptr = ptr - 1; res.push(BINOP(0x46)); },
-            I32Sub => { ptr = ptr - 1; res.push(BINOP(0x6b)); },
-            I32GeS => { ptr = ptr - 1; res.push(BINOP(0x4e)); },
-            I32LtS => { ptr = ptr - 1; res.push(BINOP(0x48)); },
-            I32GtU => { ptr = ptr - 1; res.push(BINOP(0x4b)); },
-            I32ShrS => { ptr = ptr - 1; res.push(BINOP(0x75)); },
-            I32Or => { ptr = ptr - 1; res.push(BINOP(0x72)); },
             
             I32Eqz => res.push(UNOP(0x45)),
-                
-            F32ConvertSI32 => res.push(UNOP(0xb2)),
-            F64PromoteF32 => res.push(UNOP(0xbb)),
+            I32Eq => { ptr = ptr - 1; res.push(BINOP(0x46)); },
+            I32Ne => { ptr = ptr - 1; res.push(BINOP(0x47)); },
+            I32LtS => { ptr = ptr - 1; res.push(BINOP(0x48)); },
+            I32LtU => { ptr = ptr - 1; res.push(BINOP(0x49)); },
+            I32GtS => { ptr = ptr - 1; res.push(BINOP(0x4a)); },
+            I32GtU => { ptr = ptr - 1; res.push(BINOP(0x4b)); },
+            I32LeS => { ptr = ptr - 1; res.push(BINOP(0x4c)); },
+            I32LeU => { ptr = ptr - 1; res.push(BINOP(0x4d)); },
+            I32GeS => { ptr = ptr - 1; res.push(BINOP(0x4e)); },
+            I32GeU => { ptr = ptr - 1; res.push(BINOP(0x4f)); },
             
-            _ => {
+            I64Eqz => res.push(UNOP(0x50)),
+            I64Eq => { ptr = ptr - 1; res.push(BINOP(0x51)); },
+            I64Ne => { ptr = ptr - 1; res.push(BINOP(0x52)); },
+            I64LtS => { ptr = ptr - 1; res.push(BINOP(0x53)); },
+            I64LtU => { ptr = ptr - 1; res.push(BINOP(0x54)); },
+            I64GtS => { ptr = ptr - 1; res.push(BINOP(0x55)); },
+            I64GtU => { ptr = ptr - 1; res.push(BINOP(0x56)); },
+            I64LeS => { ptr = ptr - 1; res.push(BINOP(0x57)); },
+            I64LeU => { ptr = ptr - 1; res.push(BINOP(0x58)); },
+            I64GeS => { ptr = ptr - 1; res.push(BINOP(0x59)); },
+            I64GeU => { ptr = ptr - 1; res.push(BINOP(0x5a)); },
+            
+            F32Eq => { ptr = ptr - 1; res.push(BINOP(0x5b)); },
+            F32Ne => { ptr = ptr - 1; res.push(BINOP(0x5c)); },
+            F32Lt => { ptr = ptr - 1; res.push(BINOP(0x5d)); },
+            F32Gt => { ptr = ptr - 1; res.push(BINOP(0x5e)); },
+            F32Le => { ptr = ptr - 1; res.push(BINOP(0x5f)); },
+            F32Ge => { ptr = ptr - 1; res.push(BINOP(0x60)); },
+            
+            F64Eq => { ptr = ptr - 1; res.push(BINOP(0x61)); },
+            F64Ne => { ptr = ptr - 1; res.push(BINOP(0x62)); },
+            F64Lt => { ptr = ptr - 1; res.push(BINOP(0x63)); },
+            F64Gt => { ptr = ptr - 1; res.push(BINOP(0x64)); },
+            F64Le => { ptr = ptr - 1; res.push(BINOP(0x65)); },
+            F64Ge => { ptr = ptr - 1; res.push(BINOP(0x66)); },
+
+            I32Clz => res.push(UNOP(0x67)),
+            I32Ctz => res.push(UNOP(0x68)),
+            I32Popcnt => res.push(UNOP(0x69)),
+            I32Add => { ptr = ptr - 1; res.push(BINOP(0x6a)); },
+            I32Sub => { ptr = ptr - 1; res.push(BINOP(0x6b)); },
+            I32Mul => { ptr = ptr - 1; res.push(BINOP(0x6c)); },
+            I32DivS => { ptr = ptr - 1; res.push(BINOP(0x6d)); },
+            I32DivU => { ptr = ptr - 1; res.push(BINOP(0x6e)); },
+            I32RemS => { ptr = ptr - 1; res.push(BINOP(0x6f)); },
+            I32RemU => { ptr = ptr - 1; res.push(BINOP(0x70)); },
+            I32And => { ptr = ptr - 1; res.push(BINOP(0x71)); },
+            I32Or => { ptr = ptr - 1; res.push(BINOP(0x72)); },
+            I32Xor => { ptr = ptr - 1; res.push(BINOP(0x73)); },
+            I32Shl => { ptr = ptr - 1; res.push(BINOP(0x74)); },
+            I32ShrS => { ptr = ptr - 1; res.push(BINOP(0x75)); },
+            I32ShrU => { ptr = ptr - 1; res.push(BINOP(0x75)); },
+            I32Rotl => { ptr = ptr - 1; res.push(BINOP(0x77)); },
+            I32Rotr => { ptr = ptr - 1; res.push(BINOP(0x78)); },
+
+            I64Clz => res.push(UNOP(0x79)),
+            I64Ctz => res.push(UNOP(0x7a)),
+            I64Popcnt => res.push(UNOP(0x7b)),
+            I64Add => { ptr = ptr - 1; res.push(BINOP(0x7c)); },
+            I64Sub => { ptr = ptr - 1; res.push(BINOP(0x7d)); },
+            I64Mul => { ptr = ptr - 1; res.push(BINOP(0x7e)); },
+            I64DivS => { ptr = ptr - 1; res.push(BINOP(0x7f)); },
+            I64DivU => { ptr = ptr - 1; res.push(BINOP(0x80)); },
+            I64RemS => { ptr = ptr - 1; res.push(BINOP(0x81)); },
+            I64RemU => { ptr = ptr - 1; res.push(BINOP(0x82)); },
+            I64And => { ptr = ptr - 1; res.push(BINOP(0x83)); },
+            I64Or => { ptr = ptr - 1; res.push(BINOP(0x84)); },
+            I64Xor => { ptr = ptr - 1; res.push(BINOP(0x85)); },
+            I64Shl => { ptr = ptr - 1; res.push(BINOP(0x86)); },
+            I64ShrS => { ptr = ptr - 1; res.push(BINOP(0x87)); },
+            I64ShrU => { ptr = ptr - 1; res.push(BINOP(0x88)); },
+            I64Rotl => { ptr = ptr - 1; res.push(BINOP(0x89)); },
+            I64Rotr => { ptr = ptr - 1; res.push(BINOP(0x8a)); },
+            
+            F32Abs => res.push(UNOP(0x8b)),
+            F32Neg => res.push(UNOP(0x8c)),
+            F32Ceil => res.push(UNOP(0x8d)),
+            F32Floor => res.push(UNOP(0x8e)),
+            F32Trunc => res.push(UNOP(0x8f)),
+            F32Nearest => res.push(UNOP(0x90)),
+            F32Sqrt => res.push(UNOP(0x91)),
+            F32Add => { ptr = ptr - 1; res.push(BINOP(0x92)); },
+            F32Sub => { ptr = ptr - 1; res.push(BINOP(0x93)); },
+            F32Mul => { ptr = ptr - 1; res.push(BINOP(0x94)); },
+            F32Div => { ptr = ptr - 1; res.push(BINOP(0x95)); },
+            F32Min => { ptr = ptr - 1; res.push(BINOP(0x96)); },
+            F32Max => { ptr = ptr - 1; res.push(BINOP(0x97)); },
+            F32Copysign => { ptr = ptr - 1; res.push(BINOP(0x98)); },
+            
+            F64Abs => res.push(UNOP(0x99)),
+            F64Neg => res.push(UNOP(0x9a)),
+            F64Ceil => res.push(UNOP(0x9b)),
+            F64Floor => res.push(UNOP(0x9c)),
+            F64Trunc => res.push(UNOP(0x9d)),
+            F64Nearest => res.push(UNOP(0x9e)),
+            F64Sqrt => res.push(UNOP(0x9f)),
+            F64Add => { ptr = ptr - 1; res.push(BINOP(0xa0)); },
+            F64Sub => { ptr = ptr - 1; res.push(BINOP(0xa1)); },
+            F64Mul => { ptr = ptr - 1; res.push(BINOP(0xa2)); },
+            F64Div => { ptr = ptr - 1; res.push(BINOP(0xa3)); },
+            F64Min => { ptr = ptr - 1; res.push(BINOP(0xa4)); },
+            F64Max => { ptr = ptr - 1; res.push(BINOP(0xa5)); },
+            F64Copysign => { ptr = ptr - 1; res.push(BINOP(0xa6)); },
+            
+            
+            I32WarpI64 => res.push(UNOP(0xa7)),
+            I32TruncSF32 => res.push(UNOP(0xa8)),
+            I32TruncUF32 => res.push(UNOP(0xa9)),
+            I32TruncSF64 => res.push(UNOP(0xaa)),
+            I32TruncUF64 => res.push(UNOP(0xab)),
+            I64ExtendSI32 => res.push(UNOP(0xac)),
+            I64ExtendUI32 => res.push(UNOP(0xad)),
+            I64TruncSF32 => res.push(UNOP(0xae)),
+            I64TruncUF32 => res.push(UNOP(0xaf)),
+            I64TruncSF64 => res.push(UNOP(0xb0)),
+            I64TruncUF64 => res.push(UNOP(0xb1)),
+            F32ConvertSI32 => res.push(UNOP(0xb2)),
+            F32ConvertUI32 => res.push(UNOP(0xb3)),
+            F32ConvertSI64 => res.push(UNOP(0xb4)),
+            F32ConvertUI64 => res.push(UNOP(0xb5)),
+            F32DemoteF64 => res.push(UNOP(0xb6)),
+            F64ConvertSI32 => res.push(UNOP(0xb7)),
+            F64ConvertUI32 => res.push(UNOP(0xb8)),
+            F64ConvertSI64 => res.push(UNOP(0xb9)),
+            F64ConvertUI64 => res.push(UNOP(0xba)),
+            F64PromoteF32 => res.push(UNOP(0xbb)),
+
+            I32ReinterpretF32 => res.push(UNOP(0xbc)),
+            I64ReinterpretF64 => res.push(UNOP(0xbd)),
+            F32ReinterpretI32 => res.push(UNOP(0xbe)),
+            F64ReinterpretI64 => res.push(UNOP(0xbf)),
+            
+/*            _ => {
                 println!("Unhandled {:?}", op);
-            }
+            } */
         }
     }
 }
