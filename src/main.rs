@@ -20,6 +20,7 @@ use std::collections::HashMap;
 
 // enum for op codes
 
+#[derive(Debug, Clone)]
 enum Size {
     Mem8,
     Mem16,
@@ -27,11 +28,13 @@ enum Size {
     Mem64,
 }
 
+#[derive(Debug, Clone)]
 enum Packing {
     ZX,
     SX,
 }
 
+#[derive(Debug, Clone)]
 enum Inst {
  EXIT,
  UNREACHABLE,
@@ -94,19 +97,12 @@ fn get_name(bytes: &[u8]) -> &str {
     str::from_utf8(bytes).ok().unwrap()
 }
 
-fn read_wasm_bytes(fname : &str) -> std::io::Result<Vec<u8>> {
-    let mut f = File::open(fname)?;
-
-    let mut buffer = Vec::new();
-    // read the whole file
-    f.read_to_end(&mut buffer)?;
-    return Ok(buffer);
-}
-
+#[derive(Debug, Clone)]
 struct Control {
     target : u32,
     rets : u32,
     level : u32,
+    else_label : u32,
 }
 
 /*
@@ -201,7 +197,7 @@ fn count_locals(func : &FuncBody) -> u32 {
     func.locals().iter().fold(0, |sum, x| sum + x.count())
 }
 
-fn handle_function(m : &Module, func : &FuncBody, idx : usize) {
+fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
     let sig = m.function_section().unwrap().entries()[idx].type_ref();
     let ftype = get_func_type(m, sig);
     
@@ -222,15 +218,15 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) {
     label = label + 1;
     bptr = bptr + 1;
     let rets = num_func_returns(ftype);
-    stack.push(Control {level: rets, rets: rets, target: end_label});
+    stack.push(Control {level: rets, rets: rets, target: end_label, else_label: 0});
     
     // Push default values
-    for i in (1..(count_locals(func) as usize) + ftype.params().len()) {
+    for i in 1..(count_locals(func) as usize) + ftype.params().len() {
         res.push(PUSH(0));
     }
     
     for op in func.code().elements().iter() {
-        // println!("handling {}; {:?}", ptr, op);
+        // println!("handling {}; {:?} ... label {}", ptr, op, label);
         match *op {
             Unreachable => res.push(UNREACHABLE),
             Nop => res.push(NOP),
@@ -239,14 +235,14 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) {
                 label = label + 1;
                 bptr = bptr + 1;
                 let rets = block_len(&bt);
-                stack.push(Control {level: ptr+rets, rets: rets, target: end_label});
+                stack.push(Control {level: ptr+rets, rets: rets, target: end_label, else_label: 0});
             },
             Loop(bt) => {
                 let start_label = label;
                 label = label + 1;
                 bptr = bptr + 1;
                 let rets = block_len(&bt);
-                stack.push(Control {level: ptr+rets, rets: rets, target: start_label});
+                stack.push(Control {level: ptr+rets, rets: rets, target: start_label, else_label: 0});
                 res.push(LABEL(start_label));
             },
             End => {
@@ -254,6 +250,9 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) {
                 let c : Control = stack.pop().unwrap();
                 ptr = c.level;
                 bptr = bptr - 1;
+                if (c.else_label != 0) {
+                    res.push(LABEL(c.else_label));
+                }
                 res.push(LABEL(c.target));
             },
             If(bt) => {
@@ -262,14 +261,15 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) {
                 let else_label = label;
                 let end_label = label+1;
                 let rets = block_len(&bt);
-                stack.push(Control {level: ptr+rets, rets: rets, target: end_label});
+                stack.push(Control {level: ptr+rets, rets: rets, target: end_label, else_label});
                 label = label+2;
                 res.push(UNOP(0x50)); // I64Eqz
                 res.push(JUMPI(else_label));
             },
             Else => {
-                let c : Control = stack.pop().unwrap();
-                res.push(LABEL(c.target));
+                let mut c : Control = stack.pop().unwrap();
+                res.push(LABEL(c.else_label));
+                c.else_label = 0;
                 stack.push(c);
             },
             Drop => {
@@ -400,78 +400,78 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) {
                 res.push(GROW);
             },
             
-            I32Load(flag, offset) => {
+            I32Load(_, offset) => {
                 res.push(LOAD {offset, memsize: Size::Mem32, packing:Packing::ZX});
             },
-            I32Load8S(flag, offset) => {
+            I32Load8S(_, offset) => {
                 res.push(LOAD {offset, memsize: Size::Mem8, packing:Packing::SX});
             },
-            I32Load8U(flag, offset) => {
+            I32Load8U(_, offset) => {
                 res.push(LOAD {offset, memsize: Size::Mem8, packing:Packing::ZX});
             },
-            I32Load16S(flag, offset) => {
+            I32Load16S(_, offset) => {
                 res.push(LOAD {offset, memsize: Size::Mem16, packing:Packing::SX});
             },
-            I32Load16U(flag, offset) => {
+            I32Load16U(_, offset) => {
                 res.push(LOAD {offset, memsize: Size::Mem16, packing:Packing::ZX});
             },
             
-            I64Load(flag, offset) => {
+            I64Load(_, offset) => {
                 res.push(LOAD {offset, memsize: Size::Mem64, packing:Packing::ZX});
             },
-            I64Load8S(flag, offset) => {
+            I64Load8S(_, offset) => {
                 res.push(LOAD {offset, memsize: Size::Mem8, packing:Packing::SX});
             },
-            I64Load8U(flag, offset) => {
+            I64Load8U(_, offset) => {
                 res.push(LOAD {offset, memsize: Size::Mem8, packing:Packing::ZX});
             },
-            I64Load16S(flag, offset) => {
+            I64Load16S(_, offset) => {
                 res.push(LOAD {offset, memsize: Size::Mem16, packing:Packing::SX});
             },
-            I64Load16U(flag, offset) => {
+            I64Load16U(_, offset) => {
                 res.push(LOAD {offset, memsize: Size::Mem16, packing:Packing::ZX});
             },
-            I64Load32S(flag, offset) => {
+            I64Load32S(_, offset) => {
                 res.push(LOAD {offset, memsize: Size::Mem32, packing:Packing::SX});
             },
-            I64Load32U(flag, offset) => {
+            I64Load32U(_, offset) => {
                 res.push(LOAD {offset, memsize: Size::Mem32, packing:Packing::ZX});
             },
             
-            F32Load(flag, offset) => {
+            F32Load(_, offset) => {
                 res.push(LOAD {offset, memsize: Size::Mem32, packing:Packing::ZX});
             },
-            F64Load(flag, offset) => {
+            F64Load(_, offset) => {
                 res.push(LOAD {offset, memsize: Size::Mem64, packing:Packing::ZX});
             },
             
-            I32Store(flag, offset) => {
+            I32Store(_, offset) => {
                 res.push(STORE {offset, memsize: Size::Mem32});
             },
-            I32Store8(flag, offset) => {
+            I32Store8(_, offset) => {
                 res.push(STORE {offset, memsize: Size::Mem8});
             },
-            I32Store16(flag, offset) => {
+            I32Store16(_, offset) => {
                 res.push(STORE {offset, memsize: Size::Mem16});
             },
             
-            I64Store(flag, offset) => {
+            I64Store(_, offset) => {
                 res.push(STORE {offset, memsize: Size::Mem64});
             },
-            I64Store8(flag, offset) => {
+            I64Store8(_, offset) => {
                 res.push(STORE {offset, memsize: Size::Mem8});
             },
-            I64Store16(flag, offset) => {
+            I64Store16(_, offset) => {
                 res.push(STORE {offset, memsize: Size::Mem16});
             },
-            I64Store32(flag, offset) => {
+            I64Store32(_, offset) => {
                 res.push(STORE {offset, memsize: Size::Mem32});
             },
             
-            F32Store(flag, offset) => {
+            F32Store(_, offset) => {
                 res.push(STORE {offset, memsize: Size::Mem32});
             },
-            F64Store(flag, offset) => {
+            F64Store(_, offset) => {
                 res.push(STORE {offset, memsize: Size::Mem64});
             },
             
@@ -609,11 +609,36 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) {
             F32ReinterpretI32 => res.push(UNOP(0xbe)),
             F64ReinterpretI64 => res.push(UNOP(0xbf)),
             
-/*            _ => {
-                println!("Unhandled {:?}", op);
-            } */
         }
     }
+    
+    // function exit, make stack adjustments
+    if rets > 0 {
+        for i in 0..rets-1 {
+            res.push(DUP(rets-i));
+            res.push(SET(ptr-i+1));
+            res.push(DROP(1));
+        }
+    }
+    res.push(DROP (count_locals(func) + (ftype.params().len() as u32)));
+    res.push(RETURN);
+    res
+}
+
+fn resolve_func_labels(arr : &Vec<Inst>) -> Vec<Inst> {
+    let mut table = HashMap::new();
+    for (i, el) in arr.iter().enumerate() {
+        match *el {
+            LABEL(x) => { table.insert(x, i as u32); },
+            _ => {}
+        }
+    }
+    arr.iter().map(|x| {
+        match *x {
+            JUMPI(x) => JUMPI(*(table.get(&x).unwrap())),
+            ref a => a.clone()
+        }
+        }).collect::<Vec<Inst>>()
 }
 
 fn main() {
@@ -633,44 +658,9 @@ fn main() {
     
     // so we do not have parameters here, have to the get them from elsewhere?
     for (idx,f) in code_section.bodies().iter().enumerate() {
-        handle_function(&module, f, idx);
+        let mut arr = handle_function(&module, f, idx);
+        resolve_func_labels(&mut arr);
     }
 
-
-/*
-
-    let ref buf: Vec<u8> = read_wasm_bytes(&args[1]).unwrap();
-    let mut parser = Parser::new(buf);
-    loop {
-        let state = parser.read();
-        match *state {
-            ParserState::ExportSectionEntry {
-                field,
-                ref kind,
-                index,
-            } => {
-                println!("ExportSectionEntry {{ field: \"{}\", kind: {:?}, index: {} }}",
-                         get_name(field),
-                         kind,
-                         index);
-            }
-            ParserState::ImportSectionEntry {
-                module,
-                field,
-                ref ty,
-            } => {
-                println!("ImportSectionEntry {{ module: \"{}\", field: \"{}\", ty: {:?} }}",
-                         get_name(module),
-                         get_name(field),
-                         ty);
-            }
-            ParserState::EndWasm => break,
-            // ParserState::BeginFunctionBody {range} => process_block(&mut parser),
-            ParserState::Error(err) => panic!("Error: {:?}", err),
-            _ => println!("{:?}", state),
-        }
-    }
-    let state = parser.read();
-    */
 }
 
