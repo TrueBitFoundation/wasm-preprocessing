@@ -652,6 +652,10 @@ fn resolve_func_labels(arr : &Vec<Inst>) -> Vec<Inst> {
         }).collect::<Vec<Inst>>()
 }
 
+fn init_value(m : &Module, expr : &InitExpr) -> u64 {
+    0
+}
+
 fn main() {
     let args = env::args().collect::<Vec<_>>();
     if args.len() != 2 {
@@ -672,12 +676,48 @@ fn main() {
     let mut table = HashMap::new();
     
     // init call table
+    if let Some(sec) = module.elements_section() {
+        for els in sec.entries().iter() {
+            for el in els.members().iter() {
+                res.push(NOP);
+            }
+        }
+    }
     
-    // init globals
+    // init globals, first imports
+    let mut globals = 0;
+    if let Some(sec) = module.import_section() {
+        for entry in sec.entries().iter() {
+            if let &External::Global(_) = entry.external() {
+                res.push(PUSH(0));
+                res.push(STOREGLOBAL(globals));
+                globals = globals + 1;
+            }
+        }
+    }
+    
+    // then own globals
+    if let Some(sec) = module.global_section() {
+        for g in sec.entries().iter() {
+            res.push(PUSH(init_value(&module, g.init_expr())));
+            res.push(STOREGLOBAL(globals));
+            globals = globals + 1;
+        }
+    }
     
     // init memory
+    if let Some(sec) = module.data_section() {
+        for seg in sec.entries().iter() {
+            let offset = init_value(&module, seg.offset());
+            for (i, bt) in seg.value().iter().enumerate() {
+                res.push(PUSH(offset+i as u64));
+                res.push(PUSH(*bt as u64));
+                res.push(STORE{offset:0, memsize:Size::Mem8});
+            }
+        }
+    }
     
-    // make the initializer for file system
+    // make the initializer for file system, command line parameters
     
     // handle imports (just empty codes now)
     for (idx,f) in get_func_imports(&module).iter().enumerate() {
