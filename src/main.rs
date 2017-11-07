@@ -164,6 +164,16 @@ fn get_num_imports(m : &Module) -> u32 {
     }
 }
 
+fn get_func_imports(m : &Module) -> Vec<&ImportEntry> {
+    match m.import_section() {
+        None => Vec::new(),
+        Some(sec) => {
+            let arr = sec.entries();
+            arr.iter().filter(|&x| is_func(x.external())).collect::<Vec<&ImportEntry>>()
+        }
+    }
+}
+
 fn get_func_type(m : &Module, sig : u32) -> &FunctionType {
     match m.type_section().unwrap().types()[sig as usize] {
         Type::Function(ref t) => t
@@ -652,16 +662,47 @@ fn main() {
     let module = parity_wasm::deserialize_file(&args[1]).ok().unwrap();
 
     let code_section = module.code_section().unwrap(); // Part of the module with functions code
+    let num_imports = get_num_imports(&module);
     
     println!("Function count in wasm file: {}", code_section.bodies().len());
     println!("Function signatures in wasm file: {}", module.function_section().unwrap().entries().len());
-    println!("Function imports: {}", get_num_imports(&module));
+    println!("Function imports: {}", num_imports);
+    
+    let mut res = Vec::new();
+    let mut table = HashMap::new();
+    
+    // init call table
+    
+    // init globals
+    
+    // init memory
+    
+    // make the initializer for file system
+    
+    // handle imports (just empty codes now)
+    for (idx,f) in get_func_imports(&module).iter().enumerate() {
+        table.insert(idx as u32, res.len() as u32);
+    }
     
     // so we do not have parameters here, have to the get them from elsewhere?
     for (idx,f) in code_section.bodies().iter().enumerate() {
         let mut arr = handle_function(&module, f, idx);
-        resolve_func_labels(&mut arr);
+        let arr = resolve_func_labels(&mut arr);
+        table.insert(idx as u32 +num_imports, res.len() as u32);
+        for el in arr {
+            res.push(el.clone());
+        }
     }
+    
+    // setup call table
+    
+    // resolve calls
+    let res = res.iter().map(|x| {
+        match *x {
+            CALL(x) => CALL(*(table.get(&x).unwrap())),
+            ref a => a.clone()
+        }
+        }).collect::<Vec<Inst>>();
 
 }
 
