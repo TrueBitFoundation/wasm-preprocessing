@@ -636,6 +636,7 @@ fn resolve_func_labels(arr : &Vec<Inst>) -> Vec<Inst> {
     arr.iter().map(|x| {
         match *x {
             JUMPI(x) => JUMPI(*(table.get(&x).unwrap())),
+            JUMP(x) => JUMP(*(table.get(&x).unwrap())),
             ref a => a.clone()
         }
         }).collect::<Vec<Inst>>()
