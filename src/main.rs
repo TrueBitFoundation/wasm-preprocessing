@@ -3,12 +3,8 @@ extern crate parity_wasm;
 use parity_wasm::elements::*;
 use parity_wasm::elements::Opcode::*;
 
-/*
-extern crate wasmparser;
-use wasmparser::WasmDecoder;
-use wasmparser::Parser;
-use wasmparser::ParserState;
-*/
+extern crate tiny_keccak;
+use tiny_keccak::Keccak;
 
 use std::io::prelude::*;
 use std::fs::File;
@@ -36,51 +32,51 @@ enum Packing {
 
 #[derive(Debug, Clone)]
 enum Inst {
- EXIT,
- UNREACHABLE,
- NOP,
- JUMP(u32),
- JUMPI(u32),
- JUMPFORWARD(u32),
- CALL(u32),
- LABEL(u32),
- RETURN,
- LOAD {
-    offset: u32,
-    memsize : Size,
-    packing : Packing,
- },
- STORE {
-    offset: u32,
-    memsize : Size,
- },
- DROP(u32),
- DROPN,
- DUP(u32),
- SET(u32),
- LOADGLOBAL(u32),
- STOREGLOBAL(u32),
- CURMEM,
- GROW,
- CALLI,
- CHECKCALLI(u64),
- PUSH(u64),
- UNOP(u8),
- BINOP(u8),
- STUB(String),
- INPUTSIZE,
- INPUTNAME,
- INPUTDATA,
- OUTPUTSIZE,
- OUTPUTNAME,
- OUTPUTDATA,
- INITCALLTABLE(u32),
- INITCALLTYPE(u32),
- SETSTACK(u32),
- SETCALLSTACK(u32),
- SETTABLE(u32),
- SETGLOBALS(u32),
- SETMEMORY(u32),
+    EXIT,
+    UNREACHABLE,
+    NOP,
+    JUMP(u32),
+    JUMPI(u32),
+    JUMPFORWARD(u32),
+    CALL(u32),
+    LABEL(u32),
+    RETURN,
+    LOAD {
+        offset: u32,
+        memsize : Size,
+        packing : Packing,
+    },
+    STORE {
+        offset: u32,
+        memsize : Size,
+    },
+    DROP(u32),
+    DROPN,
+    DUP(u32),
+    SET(u32),
+    LOADGLOBAL(u32),
+    STOREGLOBAL(u32),
+    CURMEM,
+    GROW,
+    CALLI,
+    CHECKCALLI(u64),
+    PUSH(u64),
+    UNOP(u8),
+    BINOP(u8),
+    STUB(String),
+    INPUTSIZE,
+    INPUTNAME,
+    INPUTDATA,
+    OUTPUTSIZE,
+    OUTPUTNAME,
+    OUTPUTDATA,
+    INITCALLTABLE(u32),
+    INITCALLTYPE(u32),
+    SETSTACK(u32),
+    SETCALLSTACK(u32),
+    SETTABLE(u32),
+    SETGLOBALS(u32),
+    SETMEMORY(u32),
 }
 
 use Inst::*;
@@ -205,6 +201,41 @@ fn num_func_returns(ft : &FunctionType) -> u32 {
 
 fn count_locals(func : &FuncBody) -> u32 {
     func.locals().iter().fold(0, |sum, x| sum + x.count())
+}
+
+fn type_code(t : &ValueType) -> u8 {
+    match *t {
+        ValueType::I32 => 0,
+        ValueType::I64 => 1,
+        ValueType::F32 => 2,
+        ValueType::F64 => 3,
+    }
+}
+
+fn hash_ftype(ft : &FunctionType) -> u64 {
+    let mut hash = Keccak::new_keccak256();
+    let mut data = Vec::new();
+    
+    for t in ft.params() {
+        data.push(type_code(t));
+    }
+    
+    data.push(0xff);
+    match ft.return_type() {
+        None => {},
+        Some(t) => data.push(type_code(&t)),
+    }
+    
+    hash.update(&data);
+    
+    let mut arr: [u8; 32] = [0; 32];
+    hash.finalize(&mut arr);
+    let mut res : u64 = 0;
+    for i in 0..7 {
+        res = res*256 + arr[i] as u64;
+    }
+    // println!("Got result {}", res);
+    res
 }
 
 fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
@@ -357,7 +388,7 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
             },
             CallIndirect(x,_) => {
                 let ftype = get_func_type(m, x);
-                // res.push(CHECKCALLI(x));
+                res.push(CHECKCALLI(hash_ftype(&ftype)));
                 res.push(CALLI);
                 ptr = ptr - (ftype.params().len() as u32) + num_func_returns(ftype) - 1;
             },
@@ -677,11 +708,17 @@ fn main() {
     
     // init call table
     if let Some(sec) = module.elements_section() {
+        let mut count = 0;
         for els in sec.entries().iter() {
             for el in els.members().iter() {
                 res.push(NOP);
+                res.push(NOP);
+                res.push(NOP);
+                res.push(NOP);
+                count = count+1;
             }
         }
+        println!("Found {} elements in the call table", count);
     }
     
     // init globals, first imports
@@ -735,7 +772,22 @@ fn main() {
     }
     
     // setup call table
-    
+    if let Some(sec) = module.elements_section() {
+        let mut pos = 0; // should be length of vm init
+        for seg in sec.entries().iter() {
+            let offset = init_value(&module, seg.offset()) as u32;
+            for (idx, fnum) in seg.members().iter().enumerate() {
+                res[pos+0] = PUSH(*table.get(fnum).unwrap() as u64);
+                res[pos+1] = INITCALLTABLE(offset + idx as u32);
+                res[pos+2] = PUSH(hash_ftype(find_func_type(&module, *fnum)));
+                res[pos+3] = INITCALLTYPE(offset + idx as u32);
+                
+                pos = pos+4;
+            }
+        }
+
+    }
+
     // resolve calls
     let res = res.iter().map(|x| {
         match *x {
