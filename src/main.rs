@@ -3,12 +3,8 @@ extern crate parity_wasm;
 use parity_wasm::elements::*;
 use parity_wasm::elements::Opcode::*;
 
-/*
-extern crate wasmparser;
-use wasmparser::WasmDecoder;
-use wasmparser::Parser;
-use wasmparser::ParserState;
-*/
+extern crate tiny_keccak;
+use tiny_keccak::Keccak;
 
 use std::io::prelude::*;
 use std::fs::File;
@@ -20,7 +16,7 @@ use std::collections::HashMap;
 
 // enum for op codes
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum Size {
     Mem8,
     Mem16,
@@ -36,62 +32,397 @@ enum Packing {
 
 #[derive(Debug, Clone)]
 enum Inst {
- EXIT,
- UNREACHABLE,
- NOP,
- JUMP(u32),
- JUMPI(u32),
- JUMPFORWARD(u32),
- CALL(u32),
- LABEL(u32),
- RETURN,
- LOAD {
-    offset: u32,
-    memsize : Size,
-    packing : Packing,
- },
- STORE {
-    offset: u32,
-    memsize : Size,
- },
- DROP(u32),
- DROPN,
- DUP(u32),
- SET(u32),
- LOADGLOBAL(u32),
- STOREGLOBAL(u32),
- CURMEM,
- GROW,
- CALLI,
- CHECKCALLI(u64),
- PUSH(u64),
- UNOP(u8),
- BINOP(u8),
- STUB(String),
- INPUTSIZE,
- INPUTNAME,
- INPUTDATA,
- OUTPUTSIZE,
- OUTPUTNAME,
- OUTPUTDATA,
- INITCALLTABLE(u32),
- INITCALLTYPE(u32),
- SETSTACK(u32),
- SETCALLSTACK(u32),
- SETTABLE(u32),
- SETGLOBALS(u32),
- SETMEMORY(u32),
+    EXIT,
+    UNREACHABLE,
+    NOP,
+    JUMP(u32),
+    JUMPI(u32),
+    JUMPFORWARD(u32),
+    CALL(u32),
+    LABEL(u32),
+    RETURN,
+    LOAD {
+        offset: u32,
+        memsize : Size,
+        packing : Packing,
+        mtype: ValueType,
+    },
+    STORE {
+        offset: u32,
+        memsize : Size,
+        mtype: ValueType,
+    },
+    DROP(u32),
+    DROPN,
+    DUP(u32),
+    SET(u32),
+    LOADGLOBAL(u32),
+    STOREGLOBAL(u32),
+    CURMEM,
+    GROW,
+    CALLI,
+    CHECKCALLI(u64),
+    PUSH(u64),
+    UNOP(u8),
+    BINOP(u8),
+    STUB(String),
+    INPUTSIZE,
+    INPUTNAME,
+    INPUTDATA,
+    OUTPUTSIZE,
+    OUTPUTNAME,
+    OUTPUTDATA,
+    INITCALLTABLE(u32),
+    INITCALLTYPE(u32),
+    SETSTACK(u32),
+    SETCALLSTACK(u32),
+    SETTABLE(u32),
+    SETGLOBALS(u32),
+    SETMEMORY(u32),
 }
 
 use Inst::*;
 
-// convert memory
+enum InCode {
+    NoIn,
+    Immed,
+    GlobalIn,
+    StackIn0,
+    StackIn1,
+    StackIn2,
+    StackInReg,
+    StackInReg2,
+    ReadPc,
+    ReadStackPtr,
+    CallIn,
+    MemoryIn1,
+    MemsizeIn,
+    TableIn,
+    MemoryIn2,
+    TableTypeIn,
+    InputSizeIn,
+    InputNameIn,
+    InputDataIn,
+}
 
-// convert globals
+enum AluCode {
+    Normal(u8),
+    Trap,
+    Exit,
+    Min,
+    CheckJump,
+    Nop,
+    FixMemory {
+        mtype: ValueType,
+        memsize : Size,
+        packing : Packing,
+    },
+    CheckJumpForward,
+    CheckDynamicCall,
+}
 
-// convert tables
+enum Reg {
+    Reg1,
+    Reg2,
+    Reg3,
+}
 
-// decoding
+enum OutCode {
+    StackOutReg1,
+    StackOut0,
+    StackOut1,
+    StackOut2,
+    CallOut,
+    NoOut,
+    GlobalOut,
+    MemoryOut1 {
+        mtype: ValueType,
+        memsize : Size,
+    },
+    MemoryOut2 {
+        mtype: ValueType,
+        memsize : Size,
+    },
+    InputSizeOut,
+    InputNameOut,
+    InputCreateOut,
+    InputDataOut,
+    CallTableOut,
+    CallTypeOut,
+    SetStack,
+    SetCallStack,
+    SetTable,
+    SetTableTypes,
+    SetMemory,
+    SetGlobals,
+}
+
+enum StackCode {
+    StackRegSub,
+    StackReg,
+    StackReg2,
+    StackReg3,
+    StackInc,
+    StackDec,
+    StackNop,
+    StackDec2,
+    StackDecImmed
+}
+
+struct DecodedOp {
+    read_reg1 : InCode,
+    read_reg2 : InCode,
+    read_reg3 : InCode,
+    write1 : (Reg, OutCode),
+    write2 : (Reg, OutCode),
+    alu_code : AluCode,
+    call_ch : StackCode,
+    stack_ch : StackCode,
+    pc_ch : StackCode,
+    mem_ch : bool,
+    immed : u64,
+}
+
+fn decode(i : &Inst) -> DecodedOp {
+    use AluCode::*;
+    use StackCode::*;
+    use InCode::*;
+    use OutCode::*;
+    use Reg::*;
+
+    let noop = DecodedOp {
+        read_reg1: NoIn,
+        read_reg2: NoIn,
+        read_reg3: NoIn,
+        write1: (Reg1, NoOut),
+        write2: (Reg1, NoOut),
+        alu_code: AluCode::Nop,
+        call_ch: StackNop,
+        stack_ch: StackNop,
+        pc_ch: StackInc,
+        mem_ch: false,
+        immed: 0
+    };
+    match *i {
+        NOP => noop,
+        STUB(_) => noop,
+        LABEL(_) => noop,
+        UNREACHABLE => DecodedOp {alu_code: Trap, .. noop},
+        EXIT => DecodedOp {alu_code:Exit, .. noop},
+        JUMP(x) => DecodedOp {immed:x as u64, read_reg1: Immed, pc_ch: StackReg, .. noop},
+        JUMPI(x) => DecodedOp {immed:x as u64, read_reg1: Immed, read_reg2: StackIn0, read_reg3: ReadPc, alu_code: CheckJump, pc_ch:StackReg, stack_ch: StackDec, .. noop},
+        JUMPFORWARD(x) => DecodedOp {immed: x as u64, read_reg1: StackIn0, read_reg2: ReadPc, alu_code: CheckJumpForward, pc_ch: StackReg, stack_ch: StackDec, .. noop},
+        CALL(x) => DecodedOp {immed:x as u64, read_reg1: Immed, read_reg2: ReadPc, write1: (Reg2, CallOut), call_ch: StackInc, pc_ch: StackReg, .. noop},
+        CHECKCALLI(x) => DecodedOp {immed:x, read_reg1: StackIn0, read_reg2: TableTypeIn, alu_code: CheckDynamicCall, pc_ch: StackInc, .. noop},
+        CALLI => DecodedOp {read_reg2: ReadPc, read_reg1: StackIn0, read_reg3: TableIn, pc_ch: StackReg3, write1: (Reg2, CallOut), call_ch: StackInc, stack_ch: StackDec, .. noop},
+        INPUTSIZE => DecodedOp {read_reg1: StackIn0, read_reg2: InputSizeIn, write1: (Reg2, StackOut1), .. noop},
+        INPUTNAME => DecodedOp {read_reg1: StackIn0, read_reg2: StackIn1, read_reg3: InputNameIn, write1: (Reg3, StackOut2), stack_ch: StackDec, .. noop},
+        INPUTDATA => DecodedOp {read_reg1: StackIn0, read_reg2: StackIn1, read_reg3: InputDataIn, write1: (Reg3, StackOut2), stack_ch: StackDec, .. noop},
+        OUTPUTSIZE => DecodedOp {read_reg1: StackIn0, read_reg2: StackIn1, write1: (Reg2, InputSizeOut), write2: (Reg2, InputCreateOut), stack_ch: StackDec2, .. noop},
+        OUTPUTNAME => DecodedOp {immed:2, read_reg1: StackIn2, read_reg2: StackIn1, read_reg3: StackIn0, write1: (Reg3, InputNameOut), stack_ch: StackDecImmed, .. noop},
+        OUTPUTDATA => DecodedOp {immed:2, read_reg1: StackIn2, read_reg2: StackIn1, read_reg3: StackIn0, write1: (Reg3, InputDataOut), stack_ch: StackDecImmed, .. noop},
+        RETURN => DecodedOp {read_reg1: CallIn, call_ch: StackDec, pc_ch: StackReg, .. noop},
+        LOAD {offset, ref memsize, ref packing, ref mtype} => DecodedOp {
+            immed: offset as u64, read_reg1: StackIn0, read_reg2: MemoryIn1, read_reg3: MemoryIn2,
+            alu_code: FixMemory{memsize:memsize.clone(), packing: packing.clone(), mtype: mtype.clone()},
+            write1: (Reg1, StackOut1), .. noop},
+        STORE {offset, ref memsize, ref mtype} => DecodedOp {
+            immed: offset as u64,
+            read_reg1: StackIn1,
+            read_reg2: StackIn0,
+            write1: (Reg2, MemoryOut1 {memsize: memsize.clone(), mtype: mtype.clone()}),
+            write2: (Reg2, MemoryOut2 {memsize: memsize.clone(), mtype: mtype.clone()}),
+            stack_ch: StackDec2, .. noop},
+        DROP(x) => DecodedOp {immed: x as u64, read_reg1: Immed, stack_ch: StackRegSub, .. noop},
+        DROPN => DecodedOp {read_reg1: StackIn0, stack_ch: StackRegSub, .. noop},
+        DUP(x) => DecodedOp {immed: x as u64, read_reg1: Immed, read_reg2: StackInReg, write1: (Reg2, StackOut0), stack_ch: StackInc, .. noop},
+        SET(x) => DecodedOp {immed: x as u64, read_reg1: Immed, read_reg2: StackIn0, write1: (Reg2, StackOutReg1), .. noop},
+        LOADGLOBAL(x) => DecodedOp {immed: x as u64, read_reg1: Immed, read_reg2: GlobalIn, write1: (Reg2, StackOut0), stack_ch: StackInc, .. noop},
+        STOREGLOBAL(x) => DecodedOp {immed: x as u64, read_reg1: Immed, read_reg2: StackIn0, write1: (Reg2, GlobalOut), stack_ch: StackDec, .. noop},
+        INITCALLTABLE(x) => DecodedOp {immed: x as u64, read_reg2: StackIn0, write1: (Reg2, CallTableOut), stack_ch: StackDec, .. noop},
+        INITCALLTYPE(x) => DecodedOp {immed: x as u64, read_reg2: StackIn0, write1: (Reg2, CallTypeOut), stack_ch: StackDec, .. noop},
+        CURMEM => DecodedOp {stack_ch: StackInc, read_reg2: MemsizeIn, write1: (Reg2, StackOut0), .. noop},
+        GROW => DecodedOp {read_reg2: MemsizeIn, read_reg3: StackIn0, mem_ch: true, stack_ch: StackDec, .. noop},
+        PUSH(lit) => DecodedOp {immed: lit, read_reg1: Immed, stack_ch: StackInc, write1: (Reg1, StackOut0), .. noop},
+        UNOP(op) => DecodedOp {read_reg1: StackIn0, write1: (Reg1, StackOut1), alu_code: Normal(op), .. noop},
+        BINOP(op) => DecodedOp {read_reg1: StackIn1, read_reg2: StackIn0, write1: (Reg1, StackOut2), alu_code: Normal(op), stack_ch: StackDec, .. noop},
+        SETSTACK(x) => DecodedOp {immed: x as u64, read_reg1: Immed, write1: (Reg1,SetStack), .. noop},
+        SETCALLSTACK(x) => DecodedOp {immed: x as u64, read_reg1: Immed, write1: (Reg1,SetCallStack), .. noop},
+        SETGLOBALS(x) => DecodedOp {immed: x as u64, read_reg1: Immed, write1: (Reg1,SetGlobals), .. noop},
+        SETMEMORY(x) => DecodedOp {immed: x as u64, read_reg1: Immed, write1: (Reg1,SetMemory), .. noop},
+        SETTABLE(x) => DecodedOp {immed: x as u64, read_reg1: Immed, write1: (Reg1,SetTableTypes), write2: (Reg1,SetTable), .. noop},
+    }
+}
+
+fn type_code(t : &ValueType) -> u8 {
+    match *t {
+        ValueType::I32 => 0,
+        ValueType::I64 => 1,
+        ValueType::F32 => 2,
+        ValueType::F64 => 3,
+    }
+}
+
+fn type_size(t : &ValueType) -> Size {
+    match *t {
+        ValueType::I32 => Size::Mem32,
+        ValueType::I64 => Size::Mem64,
+        ValueType::F32 => Size::Mem32,
+        ValueType::F64 => Size::Mem64,
+    }
+}
+
+fn sz_code(m : &Size) -> u8 {
+    match *m {
+        Size::Mem8 => 1,
+        Size::Mem16 => 2,
+        Size::Mem32 => 4,
+        Size::Mem64 => 8,
+    }
+}
+
+fn ext_code(p : &Packing) -> u8 {
+    match *p {
+        Packing::ZX => 0,
+        Packing::SX => 1,
+    }
+}
+
+fn size_code(t : &ValueType, sz : &Size, ext : &Packing) -> u8 {
+    if *sz == type_size(t) {
+        0
+    }
+    else {
+        (sz_code(sz) << 1) | ext_code(ext)
+    }
+}
+
+fn alu_byte(a : &AluCode) -> u8 {
+    use AluCode::*;
+    match *a {
+        Nop => 0x00,
+        Trap => 0x01,
+        Min => 0x02,
+        CheckJump => 0x03,
+        CheckJumpForward => 0x04,
+        Exit => 0x06,
+        CheckDynamicCall => 0x07,
+        /* type, sz, ext : 4 * 3 * 2 = 24 */
+        FixMemory {ref mtype, ref memsize, ref packing} => (0xc0 | (type_code(mtype) << 4) | size_code(mtype, memsize, packing)),
+        Normal(x) => x,
+    }
+}
+
+fn in_code_byte(c : &InCode) -> u8 {
+    use InCode::*;
+    match *c {
+        NoIn => 0x00,
+        Immed => 0x01,
+        ReadPc => 0x02,
+        ReadStackPtr => 0x03,
+        MemsizeIn => 0x04,
+        GlobalIn => 0x05,
+        StackIn0 => 0x06,
+        StackIn1 => 0x07,
+        StackInReg => 0x08,
+        StackInReg2 => 0x09,
+        CallIn => 0x0e,
+        MemoryIn1 => 0x0f,
+        TableIn => 0x10,
+        MemoryIn2 => 0x11,
+        TableTypeIn => 0x12,
+        InputSizeIn => 0x13,
+        InputNameIn => 0x14,
+        InputDataIn => 0x15,
+        StackIn2 => 0x16,
+    }
+}
+
+fn reg_byte(r : &Reg) -> u8 {
+    use Reg::*;
+    match *r {
+        Reg1 => 0x01,
+        Reg2 => 0x02,
+        Reg3 => 0x03,
+    }
+}
+
+fn out_size_code(t : &ValueType, sz : &Size) -> u8 {
+    if *sz == type_size(t) {
+        0
+    }
+    else {
+        sz_code(sz)
+    }
+}
+
+fn out_code_byte(c : &OutCode) -> u8 {
+    use OutCode::*;
+    match *c {
+        NoOut => 0x00,
+        StackOutReg1 => 0x02,
+        StackOut0 => 0x03,
+        StackOut1 => 0x04,
+        CallOut => 0x06,
+        GlobalOut => 0x08,
+        StackOut2 => 0x09,
+        InputSizeOut => 0x0a,
+        InputNameOut => 0x0b,
+        InputCreateOut => 0x0c,
+        InputDataOut => 0x0d,
+        CallTableOut => 0x0e,
+        CallTypeOut => 0x0f,
+        SetStack => 0x10,
+        SetCallStack => 0x11,
+        SetGlobals => 0x12,
+        SetTable => 0x13,
+        SetTableTypes => 0x14,
+        SetMemory => 0x15,
+        MemoryOut1 {ref mtype, ref memsize} => 0x80 | (type_code(mtype) << 3) | out_size_code(mtype, memsize),
+        MemoryOut2 {ref mtype, ref memsize} => 0xc0 | (type_code(mtype) << 3) | out_size_code(mtype, memsize),
+    }
+}
+
+fn stack_code_byte(c : &StackCode) -> u8 {
+    use StackCode::*;
+    match *c {
+        StackRegSub => 0x00,
+        StackReg => 0x01,
+        StackReg2 => 0x02,
+        StackReg3 => 0x03,
+        StackInc => 0x04,
+        StackDec => 0x05,
+        StackNop => 0x06,
+        StackDec2 => 0x07,
+        StackDecImmed => 0x08,
+    }
+}
+
+fn code_word(op : &DecodedOp) -> [u8; 32] {
+    let mut res: [u8; 32] = [0; 32];
+    res[0] = in_code_byte(&op.read_reg1);
+    res[1] = in_code_byte(&op.read_reg2);
+    res[2] = in_code_byte(&op.read_reg3);
+    res[3] = alu_byte(&op.alu_code);
+    res[4] = reg_byte(&op.write1.0);
+    res[5] = out_code_byte (&op.write1.1);
+    res[6] = reg_byte(&op.write2.0);
+    res[7] = out_code_byte(&op.write2.1);
+    res[8] = stack_code_byte(&op.call_ch);
+    res[9] = stack_code_byte(&op.stack_ch);
+    res[10] = 0x00;
+    res[11] = stack_code_byte(&op.pc_ch);
+    res[12] = if op.mem_ch { 1 } else { 0 };
+    res[13] = (op.immed >> 0) as u8;
+    res[14] = (op.immed >> 1*8) as u8;
+    res[15] = (op.immed >> 2*8) as u8;
+    res[16] = (op.immed >> 3*8) as u8;
+    res[17] = (op.immed >> 4*8) as u8;
+    res[18] = (op.immed >> 5*8) as u8;
+    res[19] = (op.immed >> 6*8) as u8;
+    res[20] = (op.immed >> 7*8) as u8;
+    res
+}
 
 fn get_name(bytes: &[u8]) -> &str {
     str::from_utf8(bytes).ok().unwrap()
@@ -207,6 +538,32 @@ fn count_locals(func : &FuncBody) -> u32 {
     func.locals().iter().fold(0, |sum, x| sum + x.count())
 }
 
+fn hash_ftype(ft : &FunctionType) -> u64 {
+    let mut hash = Keccak::new_keccak256();
+    let mut data = Vec::new();
+    
+    for t in ft.params() {
+        data.push(type_code(t));
+    }
+    
+    data.push(0xff);
+    match ft.return_type() {
+        None => {},
+        Some(t) => data.push(type_code(&t)),
+    }
+    
+    hash.update(&data);
+    
+    let mut arr: [u8; 32] = [0; 32];
+    hash.finalize(&mut arr);
+    let mut res : u64 = 0;
+    for i in 0..7 {
+        res = res*256 + arr[i] as u64;
+    }
+    // println!("Got result {}", res);
+    res
+}
+
 fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
     let sig = m.function_section().unwrap().entries()[idx].type_ref();
     let ftype = get_func_type(m, sig);
@@ -260,7 +617,7 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
                 let c : Control = stack.pop().unwrap();
                 ptr = c.level;
                 bptr = bptr - 1;
-                if (c.else_label != 0) {
+                if c.else_label != 0 {
                     res.push(LABEL(c.else_label));
                 }
                 res.push(LABEL(c.target));
@@ -357,7 +714,7 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
             },
             CallIndirect(x,_) => {
                 let ftype = get_func_type(m, x);
-                // res.push(CHECKCALLI(x));
+                res.push(CHECKCALLI(hash_ftype(&ftype)));
                 res.push(CALLI);
                 ptr = ptr - (ftype.params().len() as u32) + num_func_returns(ftype) - 1;
             },
@@ -411,78 +768,78 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
             },
             
             I32Load(_, offset) => {
-                res.push(LOAD {offset, memsize: Size::Mem32, packing:Packing::ZX});
+                res.push(LOAD {offset, memsize: Size::Mem32, packing:Packing::ZX, mtype:ValueType::I32});
             },
             I32Load8S(_, offset) => {
-                res.push(LOAD {offset, memsize: Size::Mem8, packing:Packing::SX});
+                res.push(LOAD {offset, memsize: Size::Mem8, packing:Packing::SX, mtype:ValueType::I32});
             },
             I32Load8U(_, offset) => {
-                res.push(LOAD {offset, memsize: Size::Mem8, packing:Packing::ZX});
+                res.push(LOAD {offset, memsize: Size::Mem8, packing:Packing::ZX, mtype:ValueType::I32});
             },
             I32Load16S(_, offset) => {
-                res.push(LOAD {offset, memsize: Size::Mem16, packing:Packing::SX});
+                res.push(LOAD {offset, memsize: Size::Mem16, packing:Packing::SX, mtype:ValueType::I32});
             },
             I32Load16U(_, offset) => {
-                res.push(LOAD {offset, memsize: Size::Mem16, packing:Packing::ZX});
+                res.push(LOAD {offset, memsize: Size::Mem16, packing:Packing::ZX, mtype:ValueType::I32});
             },
             
             I64Load(_, offset) => {
-                res.push(LOAD {offset, memsize: Size::Mem64, packing:Packing::ZX});
+                res.push(LOAD {offset, memsize: Size::Mem64, packing:Packing::ZX, mtype:ValueType::I64});
             },
             I64Load8S(_, offset) => {
-                res.push(LOAD {offset, memsize: Size::Mem8, packing:Packing::SX});
+                res.push(LOAD {offset, memsize: Size::Mem8, packing:Packing::SX, mtype:ValueType::I64});
             },
             I64Load8U(_, offset) => {
-                res.push(LOAD {offset, memsize: Size::Mem8, packing:Packing::ZX});
+                res.push(LOAD {offset, memsize: Size::Mem8, packing:Packing::ZX, mtype:ValueType::I64});
             },
             I64Load16S(_, offset) => {
-                res.push(LOAD {offset, memsize: Size::Mem16, packing:Packing::SX});
+                res.push(LOAD {offset, memsize: Size::Mem16, packing:Packing::SX, mtype:ValueType::I64});
             },
             I64Load16U(_, offset) => {
-                res.push(LOAD {offset, memsize: Size::Mem16, packing:Packing::ZX});
+                res.push(LOAD {offset, memsize: Size::Mem16, packing:Packing::ZX, mtype:ValueType::I64});
             },
             I64Load32S(_, offset) => {
-                res.push(LOAD {offset, memsize: Size::Mem32, packing:Packing::SX});
+                res.push(LOAD {offset, memsize: Size::Mem32, packing:Packing::SX, mtype:ValueType::I64});
             },
             I64Load32U(_, offset) => {
-                res.push(LOAD {offset, memsize: Size::Mem32, packing:Packing::ZX});
+                res.push(LOAD {offset, memsize: Size::Mem32, packing:Packing::ZX, mtype:ValueType::I64});
             },
             
             F32Load(_, offset) => {
-                res.push(LOAD {offset, memsize: Size::Mem32, packing:Packing::ZX});
+                res.push(LOAD {offset, memsize: Size::Mem32, packing:Packing::ZX, mtype:ValueType::F32});
             },
             F64Load(_, offset) => {
-                res.push(LOAD {offset, memsize: Size::Mem64, packing:Packing::ZX});
+                res.push(LOAD {offset, memsize: Size::Mem64, packing:Packing::ZX, mtype:ValueType::F64});
             },
             
             I32Store(_, offset) => {
-                res.push(STORE {offset, memsize: Size::Mem32});
+                res.push(STORE {offset, memsize: Size::Mem32, mtype:ValueType::I32});
             },
             I32Store8(_, offset) => {
-                res.push(STORE {offset, memsize: Size::Mem8});
+                res.push(STORE {offset, memsize: Size::Mem8, mtype:ValueType::I32});
             },
             I32Store16(_, offset) => {
-                res.push(STORE {offset, memsize: Size::Mem16});
+                res.push(STORE {offset, memsize: Size::Mem16, mtype:ValueType::I32});
             },
             
             I64Store(_, offset) => {
-                res.push(STORE {offset, memsize: Size::Mem64});
+                res.push(STORE {offset, memsize: Size::Mem64, mtype:ValueType::I64});
             },
             I64Store8(_, offset) => {
-                res.push(STORE {offset, memsize: Size::Mem8});
+                res.push(STORE {offset, memsize: Size::Mem8, mtype:ValueType::I64});
             },
             I64Store16(_, offset) => {
-                res.push(STORE {offset, memsize: Size::Mem16});
+                res.push(STORE {offset, memsize: Size::Mem16, mtype:ValueType::I64});
             },
             I64Store32(_, offset) => {
-                res.push(STORE {offset, memsize: Size::Mem32});
+                res.push(STORE {offset, memsize: Size::Mem32, mtype:ValueType::I64});
             },
             
             F32Store(_, offset) => {
-                res.push(STORE {offset, memsize: Size::Mem32});
+                res.push(STORE {offset, memsize: Size::Mem32, mtype:ValueType::F32});
             },
             F64Store(_, offset) => {
-                res.push(STORE {offset, memsize: Size::Mem64});
+                res.push(STORE {offset, memsize: Size::Mem64, mtype:ValueType::F64});
             },
             
             I32Eqz => res.push(UNOP(0x45)),
@@ -662,7 +1019,7 @@ fn main() {
         println!("Usage: {} in.wasm", args[0]);
         return;
     }
-    
+
     let module = parity_wasm::deserialize_file(&args[1]).ok().unwrap();
 
     let code_section = module.code_section().unwrap(); // Part of the module with functions code
@@ -671,19 +1028,25 @@ fn main() {
     println!("Function count in wasm file: {}", code_section.bodies().len());
     println!("Function signatures in wasm file: {}", module.function_section().unwrap().entries().len());
     println!("Function imports: {}", num_imports);
-    
+
     let mut res = Vec::new();
     let mut table = HashMap::new();
-    
+
     // init call table
     if let Some(sec) = module.elements_section() {
+        let mut count = 0;
         for els in sec.entries().iter() {
             for el in els.members().iter() {
                 res.push(NOP);
+                res.push(NOP);
+                res.push(NOP);
+                res.push(NOP);
+                count = count+1;
             }
         }
+        println!("Found {} elements in the call table", count);
     }
-    
+
     // init globals, first imports
     let mut globals = 0;
     if let Some(sec) = module.import_section() {
@@ -695,7 +1058,7 @@ fn main() {
             }
         }
     }
-    
+
     // then own globals
     if let Some(sec) = module.global_section() {
         for g in sec.entries().iter() {
@@ -712,7 +1075,7 @@ fn main() {
             for (i, bt) in seg.value().iter().enumerate() {
                 res.push(PUSH(offset+i as u64));
                 res.push(PUSH(*bt as u64));
-                res.push(STORE{offset:0, memsize:Size::Mem8});
+                res.push(STORE{offset:0, memsize:Size::Mem8, mtype: ValueType::I32});
             }
         }
     }
@@ -735,7 +1098,22 @@ fn main() {
     }
     
     // setup call table
-    
+    if let Some(sec) = module.elements_section() {
+        let mut pos = 0; // should be length of vm init
+        for seg in sec.entries().iter() {
+            let offset = init_value(&module, seg.offset()) as u32;
+            for (idx, fnum) in seg.members().iter().enumerate() {
+                res[pos+0] = PUSH(*table.get(fnum).unwrap() as u64);
+                res[pos+1] = INITCALLTABLE(offset + idx as u32);
+                res[pos+2] = PUSH(hash_ftype(find_func_type(&module, *fnum)));
+                res[pos+3] = INITCALLTYPE(offset + idx as u32);
+                
+                pos = pos+4;
+            }
+        }
+
+    }
+
     // resolve calls
     let res = res.iter().map(|x| {
         match *x {
@@ -743,6 +1121,11 @@ fn main() {
             ref a => a.clone()
         }
         }).collect::<Vec<Inst>>();
+    
+    for i in res.iter() {
+        let op = decode(i);
+        code_word(&op);
+    }
 
 }
 
