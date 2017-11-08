@@ -81,6 +81,174 @@ enum Inst {
 
 use Inst::*;
 
+enum InCode {
+ NoIn,
+ Immed,
+ GlobalIn,
+ StackIn0,
+ StackIn1,
+ StackIn2,
+ StackInReg,
+ StackInReg2,
+ ReadPc,
+ ReadStackPtr,
+ CallIn,
+ MemoryIn1,
+ MemsizeIn,
+ TableIn,
+ MemoryIn2,
+ TableTypeIn,
+ InputSizeIn,
+ InputNameIn,
+ InputDataIn,
+}
+
+enum AluCode {
+    Normal(u8),
+    Trap,
+    Exit,
+    Min,
+    CheckJump,
+    Nop,
+    FixMemory {
+        memsize : Size,
+        packing : Packing,
+    },
+    CheckJumpForward,
+    CheckDynamicCall,
+}
+
+enum Reg {
+    Reg1,
+    Reg2,
+    Reg3,
+}
+
+enum OutCode {
+    StackOutReg1,
+    StackOut0,
+    StackOut1,
+    StackOut2,
+    CallOut,
+    NoOut,
+    GlobalOut,
+    MemoryOut1 {
+        memsize : Size,
+    },
+    MemoryOut2 {
+        memsize : Size,
+    },
+    InputSizeOut,
+    InputNameOut,
+    InputCreateOut,
+    InputDataOut,
+    CallTableOut,
+    CallTypeOut,
+    SetStack,
+    SetCallStack,
+    SetTable,
+    SetTableTypes,
+    SetMemory,
+    SetGlobals,
+}
+
+enum StackCode {
+    StackRegSub,
+    StackReg,
+    StackReg2,
+    StackReg3,
+    StackInc,
+    StackDec,
+    StackNop,
+    StackDec2,
+    StackDecImmed
+}
+
+struct DecodedOp {
+    read_reg1 : InCode,
+    read_reg2 : InCode,
+    read_reg3 : InCode,
+    write1 : (Reg, OutCode),
+    write2 : (Reg, OutCode),
+    alu_code : AluCode,
+    call_ch : StackCode,
+    stack_ch : StackCode,
+    pc_ch : StackCode,
+    mem_ch : bool,
+    immed : u64,
+}
+
+fn decode(i : &Inst) -> DecodedOp {
+    use AluCode::*;
+    use StackCode::*;
+    use InCode::*;
+    use OutCode::*;
+    use Reg::*;
+
+    let noop = DecodedOp {
+        read_reg1: NoIn,
+        read_reg2: NoIn,
+        read_reg3: NoIn,
+        write1: (Reg1, NoOut),
+        write2: (Reg1, NoOut),
+        alu_code: AluCode::Nop,
+        call_ch: StackNop,
+        stack_ch: StackNop,
+        pc_ch: StackInc,
+        mem_ch: false,
+        immed: 0
+    };
+    match *i {
+        NOP => noop,
+        STUB(_) => noop,
+        LABEL(_) => noop,
+        UNREACHABLE => DecodedOp {alu_code: Trap, .. noop},
+        EXIT => DecodedOp {alu_code:Exit, .. noop},
+        JUMP(x) => DecodedOp {immed:x as u64, read_reg1: Immed, pc_ch: StackReg, .. noop},
+        JUMPI(x) => DecodedOp {immed:x as u64, read_reg1: Immed, read_reg2: StackIn0, read_reg3: ReadPc, alu_code: CheckJump, pc_ch:StackReg, stack_ch: StackDec, .. noop},
+        JUMPFORWARD(x) => DecodedOp {immed: x as u64, read_reg1: StackIn0, read_reg2: ReadPc, alu_code: CheckJumpForward, pc_ch: StackReg, stack_ch: StackDec, .. noop},
+        CALL(x) => DecodedOp {immed:x as u64, read_reg1: Immed, read_reg2: ReadPc, write1: (Reg2, CallOut), call_ch: StackInc, pc_ch: StackReg, .. noop},
+        CHECKCALLI(x) => DecodedOp {immed:x, read_reg1: StackIn0, read_reg2: TableTypeIn, alu_code: CheckDynamicCall, pc_ch: StackInc, .. noop},
+        CALLI => DecodedOp {read_reg2: ReadPc, read_reg1: StackIn0, read_reg3: TableIn, pc_ch: StackReg3, write1: (Reg2, CallOut), call_ch: StackInc, stack_ch: StackDec, .. noop},
+        INPUTSIZE => DecodedOp {read_reg1: StackIn0, read_reg2: InputSizeIn, write1: (Reg2, StackOut1), .. noop},
+        INPUTNAME => DecodedOp {read_reg1: StackIn0, read_reg2: StackIn1, read_reg3: InputNameIn, write1: (Reg3, StackOut2), stack_ch: StackDec, .. noop},
+        INPUTDATA => DecodedOp {read_reg1: StackIn0, read_reg2: StackIn1, read_reg3: InputDataIn, write1: (Reg3, StackOut2), stack_ch: StackDec, .. noop},
+        OUTPUTSIZE => DecodedOp {read_reg1: StackIn0, read_reg2: StackIn1, write1: (Reg2, InputSizeOut), write2: (Reg2, InputCreateOut), stack_ch: StackDec2, .. noop},
+        OUTPUTNAME => DecodedOp {immed:2, read_reg1: StackIn2, read_reg2: StackIn1, read_reg3: StackIn0, write1: (Reg3, InputNameOut), stack_ch: StackDecImmed, .. noop},
+        OUTPUTDATA => DecodedOp {immed:2, read_reg1: StackIn2, read_reg2: StackIn1, read_reg3: StackIn0, write1: (Reg3, InputDataOut), stack_ch: StackDecImmed, .. noop},
+        RETURN => DecodedOp {read_reg1: CallIn, call_ch: StackDec, pc_ch: StackReg, .. noop},
+        LOAD {offset, ref memsize, ref packing} => DecodedOp {
+            immed: offset as u64, read_reg1: StackIn0, read_reg2: MemoryIn1, read_reg3: MemoryIn2,
+            alu_code: FixMemory{memsize:memsize.clone(), packing: packing.clone()},
+            write1: (Reg1, StackOut1), .. noop},
+        STORE {offset, ref memsize} => DecodedOp {
+            immed: offset as u64,
+            read_reg1: StackIn1,
+            read_reg2: StackIn0,
+            write1: (Reg2, MemoryOut1 {memsize: memsize.clone()}),
+            write2: (Reg2, MemoryOut2 {memsize: memsize.clone()}),
+            stack_ch: StackDec2, .. noop},
+        DROP(x) => DecodedOp {immed: x as u64, read_reg1: Immed, stack_ch: StackRegSub, .. noop},
+        DROPN => DecodedOp {read_reg1: StackIn0, stack_ch: StackRegSub, .. noop},
+        DUP(x) => DecodedOp {immed: x as u64, read_reg1: Immed, read_reg2: StackInReg, write1: (Reg2, StackOut0), stack_ch: StackInc, .. noop},
+        SET(x) => DecodedOp {immed: x as u64, read_reg1: Immed, read_reg2: StackIn0, write1: (Reg2, StackOutReg1), .. noop},
+        LOADGLOBAL(x) => DecodedOp {immed: x as u64, read_reg1: Immed, read_reg2: GlobalIn, write1: (Reg2, StackOut0), stack_ch: StackInc, .. noop},
+        STOREGLOBAL(x) => DecodedOp {immed: x as u64, read_reg1: Immed, read_reg2: StackIn0, write1: (Reg2, GlobalOut), stack_ch: StackDec, .. noop},
+        INITCALLTABLE(x) => DecodedOp {immed: x as u64, read_reg2: StackIn0, write1: (Reg2, CallTableOut), stack_ch: StackDec, .. noop},
+        INITCALLTYPE(x) => DecodedOp {immed: x as u64, read_reg2: StackIn0, write1: (Reg2, CallTypeOut), stack_ch: StackDec, .. noop},
+        CURMEM => DecodedOp {stack_ch: StackInc, read_reg2: MemsizeIn, write1: (Reg2, StackOut0), .. noop},
+        GROW => DecodedOp {read_reg2: MemsizeIn, read_reg3: StackIn0, mem_ch: true, stack_ch: StackDec, .. noop},
+        PUSH(lit) => DecodedOp {immed: lit, read_reg1: Immed, stack_ch: StackInc, write1: (Reg1, StackOut0), .. noop},
+        UNOP(op) => DecodedOp {read_reg1: StackIn0, write1: (Reg1, StackOut1), alu_code: Normal(op), .. noop},
+        BINOP(op) => DecodedOp {read_reg1: StackIn1, read_reg2: StackIn0, write1: (Reg1, StackOut2), alu_code: Normal(op), stack_ch: StackDec, .. noop},
+        SETSTACK(x) => DecodedOp {immed: x as u64, read_reg1: Immed, write1: (Reg1,SetStack), .. noop},
+        SETCALLSTACK(x) => DecodedOp {immed: x as u64, read_reg1: Immed, write1: (Reg1,SetCallStack), .. noop},
+        SETGLOBALS(x) => DecodedOp {immed: x as u64, read_reg1: Immed, write1: (Reg1,SetGlobals), .. noop},
+        SETMEMORY(x) => DecodedOp {immed: x as u64, read_reg1: Immed, write1: (Reg1,SetMemory), .. noop},
+        SETTABLE(x) => DecodedOp {immed: x as u64, read_reg1: Immed, write1: (Reg1,SetTableTypes), write2: (Reg1,SetTable), .. noop},
+    }
+}
+
 // convert memory
 
 // convert globals
