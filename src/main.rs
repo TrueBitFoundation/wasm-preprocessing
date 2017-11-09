@@ -1013,6 +1013,54 @@ fn init_value(m : &Module, expr : &InitExpr) -> u64 {
     0
 }
 
+fn find_function(m : &Module, name : &str) -> Option<u32> {
+    let sec = m.export_section().unwrap();
+    for e in sec.entries() {
+        // println!("Export {}: {:?}", e.field(), e.internal());
+        if e.field() == name {
+            if let Internal::Function(arg) = *e.internal() {
+                return Some(arg);
+            }
+        }
+    }
+    None
+}
+
+fn find_global(m : &Module, name : &str) -> Option<u32> {
+    let sec = m.export_section().unwrap();
+    for e in sec.entries() {
+        // println!("Export {}: {:?}", e.field(), e.internal());
+        if e.field() == name {
+            if let Internal::Global(arg) = *e.internal() {
+                return Some(arg);
+            }
+        }
+    }
+    None
+}
+
+fn simple_call(m : &Module, res : &mut Vec<Inst>, name : &str) {
+    if let Some(f) = find_function(m, name) {
+        res.push(CALL(f));
+    }
+}
+
+fn generic_stub(m : &Module, res : &mut Vec<Inst>, mname : &str, fname : &str) {
+    res.push(STUB(mname.to_owned() + "." + fname));
+    if let Some(f) = find_function(m, "_callArguments") {
+        res.push(CALL(f));
+        res.push(DROPN);
+        simple_call(m, res, "_callMemory");
+        simple_call(m, res, "_callReturns");
+        res.push(JUMPI(0xffffffff - 2));
+        res.push(JUMP(0xffffffff - 3));
+        res.push(LABEL(0xffffffff - 2));
+        simple_call(m, res, "_getReturn");
+        res.push(LABEL(0xffffffff - 3));
+    }
+    res.push(RETURN);
+}
+
 fn main() {
     let args = env::args().collect::<Vec<_>>();
     if args.len() != 2 {
@@ -1031,6 +1079,8 @@ fn main() {
 
     let mut res = Vec::new();
     let mut table = HashMap::new();
+    
+    // Initialize vm parameters
 
     // init call table
     if let Some(sec) = module.elements_section() {
@@ -1080,11 +1130,85 @@ fn main() {
         }
     }
     
-    // make the initializer for file system, command line parameters
+    // make the initializer for file system
+    let malloc = find_function(&module, "_malloc");
     
-    // handle imports (just empty codes now)
+    simple_call(&module, &mut res, "_initSystem");
+
+    // command line parameters: have nothing here ATM
+    res.push(PUSH(0));
+    res.push(PUSH(0));
+
+    // C++ initialization
+    simple_call(&module, &mut res, "__GLOBAL__I_000101");
+    simple_call(&module, &mut res, "__GLOBAL__sub_I_iostream_cpp");
+    
+    // handle imports
     for (idx,f) in get_func_imports(&module).iter().enumerate() {
         table.insert(idx as u32, res.len() as u32);
+        if f.module() == "env" {
+            if f.field() == "_inputName" {
+                res.push(INPUTNAME);
+                res.push(RETURN);
+            }
+            else if f.field() == "_inputSize" {
+                res.push(INPUTNAME);
+                res.push(RETURN);
+            }
+            else if f.field() == "_inputData" {
+                res.push(INPUTNAME);
+                res.push(RETURN);
+            }
+            else if f.field() == "_outputName" {
+                res.push(OUTPUTNAME);
+                res.push(RETURN);
+            }
+            else if f.field() == "_outputSize" {
+                res.push(OUTPUTSIZE);
+                res.push(RETURN);
+            }
+            else if f.field() == "_outputData" {
+                res.push(OUTPUTDATA);
+                res.push(RETURN);
+            }
+            else if f.field() == "_abort" {
+                res.push(UNREACHABLE);
+            }
+            else if f.field() == "_exit" {
+                simple_call(&module, &mut res, "_finalizeSystem");
+                res.push(EXIT);
+            }
+            else if f.field() == "setTempRet0" {
+                res.push(RETURN);
+            }
+            else if f.field() == "_debugString" {
+                res.push(STUB(String::from("env._debugString")));
+                res.push(RETURN);
+            }
+            else if f.field() == "_debugInt" {
+                res.push(STUB(String::from("env._debugInt")));
+                res.push(RETURN);
+            }
+            else if f.field() == "_debugBuffer" {
+                res.push(STUB(String::from("env._debugBuffer")));
+                res.push(DROP(1));
+                res.push(RETURN);
+            }
+            else if f.field() == "getTotalMemory" {
+                if let Some(g) = find_global(&module, "TOTAL_MEMORY") {
+                    res.push(LOADGLOBAL(g));
+                }
+                else {
+                    res.push(PUSH(1024*1024*1500));
+                }
+            }
+            else {
+                generic_stub(&module, &mut res, f.module(), f.field());
+            }
+        }
+        else {
+            generic_stub(&module, &mut res, f.module(), f.field());
+        }
     }
     
     // so we do not have parameters here, have to the get them from elsewhere?
