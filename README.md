@@ -1,4 +1,9 @@
 # wasm-preprocessing
+
+<p align="center">
+  <img src="./Computation Layer.jpg"/>
+</p>
+
 Software needed for preprocessing WASM files so that they can be ran on the TrueBit VM.
 
 I think it will be better to implement these steps in some other language than OCaml, because OCaml can currently only run in the Truebit
