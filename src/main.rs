@@ -11,6 +11,7 @@ use std::fs::File;
 
 use std::str;
 use std::env;
+use std::fmt;
 
 use std::collections::HashMap;
 
@@ -190,6 +191,8 @@ fn decode(i : &Inst) -> DecodedOp {
     use OutCode::*;
     use Reg::*;
 
+    let magic_pc : u64 = 0xffffffffff;
+
     let noop = DecodedOp {
         read_reg1: NoIn,
         read_reg2: NoIn,
@@ -208,7 +211,7 @@ fn decode(i : &Inst) -> DecodedOp {
         STUB(_) => noop,
         LABEL(_) => noop,
         UNREACHABLE => DecodedOp {alu_code: Trap, .. noop},
-        EXIT => DecodedOp {alu_code:Exit, .. noop},
+        EXIT => DecodedOp {immed:magic_pc, read_reg1: Immed, pc_ch: StackReg, .. noop},
         JUMP(x) => DecodedOp {immed:x as u64, read_reg1: Immed, pc_ch: StackReg, .. noop},
         JUMPI(x) => DecodedOp {immed:x as u64, read_reg1: Immed, read_reg2: StackIn0, read_reg3: ReadPc, alu_code: CheckJump, pc_ch:StackReg, stack_ch: StackDec, .. noop},
         JUMPFORWARD(x) => DecodedOp {immed: x as u64, read_reg1: StackIn0, read_reg2: ReadPc, alu_code: CheckJumpForward, pc_ch: StackReg, stack_ch: StackDec, .. noop},
@@ -400,28 +403,58 @@ fn stack_code_byte(c : &StackCode) -> u8 {
 
 fn code_word(op : &DecodedOp) -> [u8; 32] {
     let mut res: [u8; 32] = [0; 32];
-    res[0] = in_code_byte(&op.read_reg1);
-    res[1] = in_code_byte(&op.read_reg2);
-    res[2] = in_code_byte(&op.read_reg3);
-    res[3] = alu_byte(&op.alu_code);
-    res[4] = reg_byte(&op.write1.0);
-    res[5] = out_code_byte (&op.write1.1);
-    res[6] = reg_byte(&op.write2.0);
-    res[7] = out_code_byte(&op.write2.1);
-    res[8] = stack_code_byte(&op.call_ch);
-    res[9] = stack_code_byte(&op.stack_ch);
-    res[10] = 0x00;
-    res[11] = stack_code_byte(&op.pc_ch);
-    res[12] = if op.mem_ch { 1 } else { 0 };
-    res[13] = (op.immed >> 0) as u8;
-    res[14] = (op.immed >> 1*8) as u8;
-    res[15] = (op.immed >> 2*8) as u8;
-    res[16] = (op.immed >> 3*8) as u8;
-    res[17] = (op.immed >> 4*8) as u8;
-    res[18] = (op.immed >> 5*8) as u8;
-    res[19] = (op.immed >> 6*8) as u8;
-    res[20] = (op.immed >> 7*8) as u8;
+    res[31-0] = in_code_byte(&op.read_reg1);
+    res[31-1] = in_code_byte(&op.read_reg2);
+    res[31-2] = in_code_byte(&op.read_reg3);
+    res[31-3] = alu_byte(&op.alu_code);
+    res[31-4] = reg_byte(&op.write1.0);
+    res[31-5] = out_code_byte (&op.write1.1);
+    res[31-6] = reg_byte(&op.write2.0);
+    res[31-7] = out_code_byte(&op.write2.1);
+    res[31-8] = stack_code_byte(&op.call_ch);
+    res[31-9] = stack_code_byte(&op.stack_ch);
+    res[31-10] = 0x00;
+    res[31-11] = stack_code_byte(&op.pc_ch);
+    res[31-12] = if op.mem_ch { 1 } else { 0 };
+    res[31-13] = (op.immed >> 0) as u8;
+    res[31-14] = (op.immed >> 1*8) as u8;
+    res[31-15] = (op.immed >> 2*8) as u8;
+    res[31-16] = (op.immed >> 3*8) as u8;
+    res[31-17] = (op.immed >> 4*8) as u8;
+    res[31-18] = (op.immed >> 5*8) as u8;
+    res[31-19] = (op.immed >> 6*8) as u8;
+    res[31-20] = (op.immed >> 7*8) as u8;
     res
+}
+
+struct HexSlice<'a>(&'a [u8]);
+
+impl<'a> HexSlice<'a> {
+    fn new<T>(data: &'a T) -> HexSlice<'a> 
+        where T: ?Sized + AsRef<[u8]> + 'a
+    {
+        HexSlice(data.as_ref())
+    }
+}
+
+// You can even choose to implement multiple traits, like Lower and UpperHex
+impl<'a> fmt::Display for HexSlice<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        for byte in self.0 {
+            // Decide if you want to pad out the value here
+            if *byte > 16 {
+               write!(f, "{:x}", byte)?;
+            }
+            else {
+               write!(f, "0{:x}", byte)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn code_str(arr : &[u8; 32]) -> String {
+    HexSlice::new(arr).to_string()
 }
 
 fn get_name(bytes: &[u8]) -> &str {
@@ -568,8 +601,6 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
     let sig = m.function_section().unwrap().entries()[idx].type_ref();
     let ftype = get_func_type(m, sig);
     
-    println!("Got function with {:?} ops, {:?} locals and {} params",
-        func.code().elements().len(), count_locals(func), ftype.params().len());
     // println!("{:?}", func.code().elements());
     
     // let num_imports = get_num_imports(m);
@@ -585,15 +616,17 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
     label = label + 1;
     bptr = bptr + 1;
     let rets = num_func_returns(ftype);
-    stack.push(Control {level: rets, rets: rets, target: end_label, else_label: 0});
+    stack.push(Control {level: ptr+rets, rets: rets, target: end_label, else_label: 0});
     
+    println!("Got function with {:?} ops, {:?} locals, {} params, {} rets",
+        func.code().elements().len(), count_locals(func), ftype.params().len(), rets);
     // Push default values
-    for i in 1..(count_locals(func) as usize) + ftype.params().len() {
+    for i in 1..(count_locals(func) as usize) {
         res.push(PUSH(0));
     }
     
     for op in func.code().elements().iter() {
-        // println!("handling {}; {:?} ... label {}", ptr, op, label);
+        println!("handling {}; {:?} ... label {}", ptr, op, label);
         match *op {
             Unreachable => res.push(UNREACHABLE),
             Nop => res.push(NOP),
@@ -981,7 +1014,7 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
     
     // function exit, make stack adjustments
     if rets > 0 {
-        for i in 0..rets-1 {
+        for i in 0..rets {
             res.push(DUP(rets-i));
             res.push(SET(ptr-i+1));
             res.push(DROP(1));
@@ -1081,6 +1114,13 @@ fn main() {
     let mut table = HashMap::new();
     
     // Initialize vm parameters
+    res.push(PUSH(0x5f5e100));
+    res.push(GROW);
+    res.push(SETSTACK(0xe));
+    res.push(SETMEMORY(0x10));
+    res.push(SETCALLSTACK(0xa));
+    res.push(SETGLOBALS(0x8));
+    res.push(SETTABLE(0x8));
 
     // init call table
     if let Some(sec) = module.elements_section() {
@@ -1143,6 +1183,9 @@ fn main() {
     simple_call(&module, &mut res, "__GLOBAL__I_000101");
     simple_call(&module, &mut res, "__GLOBAL__sub_I_iostream_cpp");
     
+    simple_call(&module, &mut res, "_main");
+    res.push(EXIT);
+
     // handle imports
     for (idx,f) in get_func_imports(&module).iter().enumerate() {
         table.insert(idx as u32, res.len() as u32);
@@ -1214,6 +1257,9 @@ fn main() {
     // so we do not have parameters here, have to the get them from elsewhere?
     for (idx,f) in code_section.bodies().iter().enumerate() {
         let mut arr = handle_function(&module, f, idx);
+        for i in arr.iter() {
+        
+        }
         let arr = resolve_func_labels(&mut arr);
         table.insert(idx as u32 +num_imports, res.len() as u32);
         for el in arr {
@@ -1248,7 +1294,8 @@ fn main() {
     
     for i in res.iter() {
         let op = decode(i);
-        code_word(&op);
+        let w = code_word(&op);
+        println!("{:?}: {}", i, code_str(&w));
     }
 
 }
