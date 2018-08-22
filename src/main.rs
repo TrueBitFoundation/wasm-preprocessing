@@ -8,6 +8,7 @@ use tiny_keccak::Keccak;
 
 use std::io::prelude::*;
 use std::fs::File;
+use std::io::Write;
 
 use std::str;
 use std::env;
@@ -38,6 +39,7 @@ enum Inst {
     NOP,
     JUMP(u32),
     JUMPI(u32),
+    JUMPZ(u32),
     JUMPFORWARD(u32),
     CALL(u32),
     LABEL(u32),
@@ -112,6 +114,7 @@ enum AluCode {
     Exit,
     Min,
     CheckJump,
+    CheckJumpZ,
     Nop,
     FixMemory {
         mtype: ValueType,
@@ -214,6 +217,7 @@ fn decode(i : &Inst) -> DecodedOp {
         EXIT => DecodedOp {immed:magic_pc, read_reg1: Immed, pc_ch: StackReg, .. noop},
         JUMP(x) => DecodedOp {immed:x as u64, read_reg1: Immed, pc_ch: StackReg, .. noop},
         JUMPI(x) => DecodedOp {immed:x as u64, read_reg1: Immed, read_reg2: StackIn0, read_reg3: ReadPc, alu_code: CheckJump, pc_ch:StackReg, stack_ch: StackDec, .. noop},
+        JUMPZ(x) => DecodedOp {immed:x as u64, read_reg1: Immed, read_reg2: StackIn0, read_reg3: ReadPc, alu_code: CheckJumpZ, pc_ch:StackReg, stack_ch: StackDec, .. noop},
         JUMPFORWARD(x) => DecodedOp {immed: x as u64, read_reg1: StackIn0, read_reg2: ReadPc, alu_code: CheckJumpForward, pc_ch: StackReg, stack_ch: StackDec, .. noop},
         CALL(x) => DecodedOp {immed:x as u64, read_reg1: Immed, read_reg2: ReadPc, write1: (Reg2, CallOut), call_ch: StackInc, pc_ch: StackReg, .. noop},
         CHECKCALLI(x) => DecodedOp {immed:x, read_reg1: StackIn0, read_reg2: TableTypeIn, alu_code: CheckDynamicCall, pc_ch: StackInc, .. noop},
@@ -310,6 +314,7 @@ fn alu_byte(a : &AluCode) -> u8 {
         CheckJumpForward => 0x04,
         Exit => 0x06,
         CheckDynamicCall => 0x07,
+        CheckJumpZ => 0x08,
         /* type, sz, ext : 4 * 3 * 2 = 24 */
         FixMemory {ref mtype, ref memsize, ref packing} => (0xc0 | (type_code(mtype) << 4) | size_code(mtype, memsize, packing)),
         Normal(x) => x,
@@ -440,9 +445,10 @@ impl<'a> HexSlice<'a> {
 // You can even choose to implement multiple traits, like Lower and UpperHex
 impl<'a> fmt::Display for HexSlice<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "0x")?;
         for byte in self.0 {
             // Decide if you want to pad out the value here
-            if *byte > 16 {
+            if *byte > 15 {
                write!(f, "{:x}", byte)?;
             }
             else {
@@ -467,6 +473,8 @@ struct Control {
     rets : u32,
     level : u32,
     else_label : u32,
+    ite : bool,
+    luuppi : bool,
 }
 
 /*
@@ -607,7 +615,7 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
     
     let mut res : Vec<Inst> = Vec::new();
     let mut stack : Vec<Control> = Vec::new();
-    let mut label : u32 = 0;
+    let mut label : u32 = 1;
     let mut ptr : u32 = count_locals(func) + (ftype.params().len() as u32);
     let mut bptr : u32 = 0;
     
@@ -616,17 +624,21 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
     label = label + 1;
     bptr = bptr + 1;
     let rets = num_func_returns(ftype);
-    stack.push(Control {level: ptr+rets, rets: rets, target: end_label, else_label: 0});
     
-    println!("Got function with {:?} ops, {:?} locals, {} params, {} rets",
+    let def = Control {level: ptr+rets, rets: rets, target: end_label, else_label: 0, ite: false, luuppi: false};
+
+    stack.push(def.clone());
+    
+    eprintln!("Got function with {:?} ops, {:?} locals, {} params, {} rets",
         func.code().elements().len(), count_locals(func), ftype.params().len(), rets);
     // Push default values
-    for i in 1..(count_locals(func) as usize) {
+    for i in 0..(count_locals(func) as usize) {
+        eprintln!("pushing default");
         res.push(PUSH(0));
     }
     
     for op in func.code().elements().iter() {
-        println!("handling {}; {:?} ... label {}", ptr, op, label);
+        eprintln!("handling {} / {}; {:?} ... label {}", ptr, stack.len(), op, label);
         match *op {
             Unreachable => res.push(UNREACHABLE),
             Nop => res.push(NOP),
@@ -635,14 +647,14 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
                 label = label + 1;
                 bptr = bptr + 1;
                 let rets = block_len(&bt);
-                stack.push(Control {level: ptr+rets, rets: rets, target: end_label, else_label: 0});
+                stack.push(Control {level: ptr+rets, rets: rets, target: end_label, .. def});
             },
             Loop(bt) => {
                 let start_label = label;
                 label = label + 1;
                 bptr = bptr + 1;
                 let rets = block_len(&bt);
-                stack.push(Control {level: ptr+rets, rets: rets, target: start_label, else_label: 0});
+                stack.push(Control {level: ptr, rets: 0, target: start_label, luuppi: true, .. def});
                 res.push(LABEL(start_label));
             },
             End => {
@@ -650,24 +662,35 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
                 let c : Control = stack.pop().unwrap();
                 ptr = c.level;
                 bptr = bptr - 1;
-                if c.else_label != 0 {
-                    res.push(LABEL(c.else_label));
+                if c.ite {
+                    if c.else_label != 0 {
+                        res.push(LABEL(c.else_label));
+                    }
+                    else {
+                        res.push(NOP);
+                    }
                 }
-                res.push(LABEL(c.target));
+                if (!c.luuppi) {
+                    res.push(LABEL(c.target));
+                }
             },
             If(bt) => {
                 ptr = ptr - 1;
                 bptr = bptr + 1;
                 let else_label = label;
                 let end_label = label+1;
-                let rets = block_len(&bt);
-                stack.push(Control {level: ptr+rets, rets: rets, target: end_label, else_label});
+                // let rets = block_len(&bt);
+                // eprintln!("Level if {}", ptr);
+                stack.push(Control {level: ptr, rets: rets, target: end_label, else_label, ite: true, .. def});
                 label = label+2;
-                res.push(UNOP(0x50)); // I64Eqz
-                res.push(JUMPI(else_label));
+                res.push(JUMPZ(else_label));
             },
             Else => {
                 let mut c : Control = stack.pop().unwrap();
+                // eprintln!("Level else {}", c.level);
+                ptr = c.level;
+                res.push(NOP);
+                res.push(JUMP(c.target));
                 res.push(LABEL(c.else_label));
                 c.else_label = 0;
                 stack.push(c);
@@ -679,6 +702,7 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
             
             Br(x) => {
                 let c = &stack[stack.len() - (x as usize) - 1];
+                eprintln!("Debug br {:?} {}", c, c.level);
                 adjust_stack(&mut res, ptr - c.level, c.rets);
                 ptr = ptr - c.rets;
                 res.push(JUMP(c.target));
@@ -846,32 +870,41 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
             },
             
             I32Store(_, offset) => {
+                ptr = ptr - 2;
                 res.push(STORE {offset, memsize: Size::Mem32, mtype:ValueType::I32});
             },
             I32Store8(_, offset) => {
+                ptr = ptr - 2;
                 res.push(STORE {offset, memsize: Size::Mem8, mtype:ValueType::I32});
             },
             I32Store16(_, offset) => {
+                ptr = ptr - 2;
                 res.push(STORE {offset, memsize: Size::Mem16, mtype:ValueType::I32});
             },
             
             I64Store(_, offset) => {
+                ptr = ptr - 2;
                 res.push(STORE {offset, memsize: Size::Mem64, mtype:ValueType::I64});
             },
             I64Store8(_, offset) => {
+                ptr = ptr - 2;
                 res.push(STORE {offset, memsize: Size::Mem8, mtype:ValueType::I64});
             },
             I64Store16(_, offset) => {
+                ptr = ptr - 2;
                 res.push(STORE {offset, memsize: Size::Mem16, mtype:ValueType::I64});
             },
             I64Store32(_, offset) => {
+                ptr = ptr - 2;
                 res.push(STORE {offset, memsize: Size::Mem32, mtype:ValueType::I64});
             },
             
             F32Store(_, offset) => {
+                ptr = ptr - 2;
                 res.push(STORE {offset, memsize: Size::Mem32, mtype:ValueType::F32});
             },
             F64Store(_, offset) => {
+                ptr = ptr - 2;
                 res.push(STORE {offset, memsize: Size::Mem64, mtype:ValueType::F64});
             },
             
@@ -1025,17 +1058,23 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
     res
 }
 
-fn resolve_func_labels(arr : &Vec<Inst>) -> Vec<Inst> {
+fn resolve_func_labels(arr : &Vec<Inst>, n : usize) -> Vec<Inst> {
     let mut table = HashMap::new();
     for (i, el) in arr.iter().enumerate() {
         match *el {
-            LABEL(x) => { table.insert(x, i as u32); },
+            LABEL(x) => {
+               if let Some(k) = table.get(&x) {
+                   eprintln!("Label conflict {} was {}", x, k);
+               }
+               table.insert(x, (i+n) as u32);
+            },
             _ => {}
         }
     }
     arr.iter().map(|x| {
         match *x {
             JUMPI(x) => JUMPI(*(table.get(&x).unwrap())),
+            JUMPZ(x) => JUMPZ(*(table.get(&x).unwrap())),
             JUMP(x) => JUMP(*(table.get(&x).unwrap())),
             ref a => a.clone()
         }
@@ -1043,7 +1082,14 @@ fn resolve_func_labels(arr : &Vec<Inst>) -> Vec<Inst> {
 }
 
 fn init_value(m : &Module, expr : &InitExpr) -> u64 {
-    0
+    eprintln!("init {:?}", expr);
+    match expr.code()[0] {
+      I32Const(a) => a as u64,
+      F32Const(a) => a as u64,
+      I64Const(a) => a as u64,
+      F64Const(a) => a as u64,
+      _ => 0
+    }
 }
 
 fn find_function(m : &Module, name : &str) -> Option<u32> {
@@ -1074,6 +1120,7 @@ fn find_global(m : &Module, name : &str) -> Option<u32> {
 
 fn simple_call(m : &Module, res : &mut Vec<Inst>, name : &str) {
     if let Some(f) = find_function(m, name) {
+        eprintln!("Found function {}: {}", name, f);
         res.push(CALL(f));
     }
 }
@@ -1106,9 +1153,9 @@ fn main() {
     let code_section = module.code_section().unwrap(); // Part of the module with functions code
     let num_imports = get_num_imports(&module);
     
-    println!("Function count in wasm file: {}", code_section.bodies().len());
-    println!("Function signatures in wasm file: {}", module.function_section().unwrap().entries().len());
-    println!("Function imports: {}", num_imports);
+    eprintln!("Function count in wasm file: {}", code_section.bodies().len());
+    eprintln!("Function signatures in wasm file: {}", module.function_section().unwrap().entries().len());
+    eprintln!("Function imports: {}", num_imports);
 
     let mut res = Vec::new();
     let mut table = HashMap::new();
@@ -1116,13 +1163,14 @@ fn main() {
     // Initialize vm parameters
     res.push(PUSH(0x5f5e100));
     res.push(GROW);
-    res.push(SETSTACK(0xe));
-    res.push(SETMEMORY(0x10));
+    res.push(SETSTACK(20));
+    res.push(SETMEMORY(20));
     res.push(SETCALLSTACK(0xa));
     res.push(SETGLOBALS(0x8));
-    res.push(SETTABLE(0x8));
+    res.push(SETTABLE(20));
 
     // init call table
+    let call_loc = res.len();
     if let Some(sec) = module.elements_section() {
         let mut count = 0;
         for els in sec.entries().iter() {
@@ -1173,16 +1221,25 @@ fn main() {
     // make the initializer for file system
     let malloc = find_function(&module, "_malloc");
     
+    simple_call(&module, &mut res, "_post_instantiate");
     simple_call(&module, &mut res, "_initSystem");
 
+    // C++ initialization
+    simple_call(&module, &mut res, "__GLOBAL__I_000101");
+    if let Some(sec) = module.export_section() {
+        for e in sec.entries() {
+            // println!("Export {}: {:?}", e.field(), e.internal());
+            if e.field().starts_with("__GLOBAL__sub_I") || e.field().starts_with("___cxx_global_var_init") {
+                simple_call(&module, &mut res, e.field());
+            }
+        }
+    }
+    // simple_call(&module, &mut res, "__GLOBAL__sub_I_iostream_cpp");
+    
     // command line parameters: have nothing here ATM
     res.push(PUSH(0));
     res.push(PUSH(0));
 
-    // C++ initialization
-    simple_call(&module, &mut res, "__GLOBAL__I_000101");
-    simple_call(&module, &mut res, "__GLOBAL__sub_I_iostream_cpp");
-    
     simple_call(&module, &mut res, "_main");
     res.push(EXIT);
 
@@ -1214,8 +1271,30 @@ fn main() {
                 res.push(OUTPUTDATA);
                 res.push(RETURN);
             }
+            else if f.field().starts_with("_invoke") {
+                let mut str : String = "_dynCall_".to_owned() + &f.field()[7..];
+                simple_call(&module, &mut res, &str);
+                res.push(RETURN);
+            }
             else if f.field() == "_abort" {
                 res.push(UNREACHABLE);
+            }
+            else if f.field() == "_sbrk" {
+                let offset = 1024;
+                let topptr = find_global(&module, "_system_ptr").unwrap();
+                res.push(STUB(String::from("sbrk")));
+                res.push(LOADGLOBAL(topptr));
+                res.push(LOAD {memsize: Size::Mem32, packing:Packing::ZX, mtype:ValueType::I32, offset});
+                res.push(DUP(1));
+                res.push(DUP(3));
+                res.push(BINOP(0x6a)); // I32OpAdd));
+                res.push(LOADGLOBAL(topptr));
+                res.push(DUP(2));
+                res.push(STORE {memsize: Size::Mem32, mtype:ValueType::I32, offset});
+                res.push(DUP(2));
+                res.push(SET(4));
+                res.push(DROP(3));
+                res.push(RETURN);
             }
             else if f.field() == "_exit" {
                 simple_call(&module, &mut res, "_finalizeSystem");
@@ -1244,6 +1323,17 @@ fn main() {
                 else {
                     res.push(PUSH(1024*1024*1500));
                 }
+                res.push(RETURN);
+            }
+            else if f.field() == "_getSystem" {
+                let g = find_global(&module, "_system_ptr").unwrap();
+                res.push(LOADGLOBAL(g));
+                res.push(RETURN);
+            }
+            else if f.field() == "_setSystem" {
+                let g = find_global(&module, "_system_ptr").unwrap();
+                res.push(STOREGLOBAL(g));
+                res.push(RETURN);
             }
             else {
                 generic_stub(&module, &mut res, f.module(), f.field());
@@ -1257,19 +1347,17 @@ fn main() {
     // so we do not have parameters here, have to the get them from elsewhere?
     for (idx,f) in code_section.bodies().iter().enumerate() {
         let mut arr = handle_function(&module, f, idx);
-        for i in arr.iter() {
-        
-        }
-        let arr = resolve_func_labels(&mut arr);
+        let arr = resolve_func_labels(&mut arr, res.len());
         table.insert(idx as u32 +num_imports, res.len() as u32);
+        eprintln!("Generated function {} at {}", idx as u32 + num_imports, res.len());
         for el in arr {
             res.push(el.clone());
         }
     }
-    
+
     // setup call table
     if let Some(sec) = module.elements_section() {
-        let mut pos = 0; // should be length of vm init
+        let mut pos = call_loc; // should be length of vm init
         for seg in sec.entries().iter() {
             let offset = init_value(&module, seg.offset()) as u32;
             for (idx, fnum) in seg.members().iter().enumerate() {
@@ -1290,12 +1378,16 @@ fn main() {
             CALL(x) => CALL(*(table.get(&x).unwrap())),
             ref a => a.clone()
         }
-        }).collect::<Vec<Inst>>();
+    }).collect::<Vec<Inst>>();
     
+    let mut f = File::create("test.micro").expect("Unable to create file");
+
     for i in res.iter() {
         let op = decode(i);
         let w = code_word(&op);
-        println!("{:?}: {}", i, code_str(&w));
+        f.write_all(&w).expect("Unable to write data");
+        eprintln!("{:?}: {}", i, code_str(&w));
+        println!("{}", code_str(&w));
     }
 
 }
