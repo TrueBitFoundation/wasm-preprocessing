@@ -6,7 +6,7 @@ use parity_wasm::elements::Opcode::*;
 extern crate tiny_keccak;
 use tiny_keccak::Keccak;
 
-use std::io::prelude::*;
+// use std::io::prelude::*;
 use std::fs::File;
 use std::io::Write;
 
@@ -82,6 +82,9 @@ enum Inst {
     SETTABLE(u32),
     SETGLOBALS(u32),
     SETMEMORY(u32),
+    DEBUGSTRING,
+    DEBUGINT,
+    DEBUGBUFFER,
 }
 
 use Inst::*;
@@ -123,6 +126,9 @@ enum AluCode {
     },
     CheckJumpForward,
     CheckDynamicCall,
+    DebugInt,
+    DebugString,
+    DebugBuffer,
 }
 
 enum Reg {
@@ -258,6 +264,9 @@ fn decode(i : &Inst) -> DecodedOp {
         SETGLOBALS(x) => DecodedOp {immed: x as u64, read_reg1: Immed, write1: (Reg1,SetGlobals), .. noop},
         SETMEMORY(x) => DecodedOp {immed: x as u64, read_reg1: Immed, write1: (Reg1,SetMemory), .. noop},
         SETTABLE(x) => DecodedOp {immed: x as u64, read_reg1: Immed, write1: (Reg1,SetTableTypes), write2: (Reg1,SetTable), .. noop},
+        DEBUGINT => DecodedOp {read_reg1: StackIn0, alu_code:DebugInt, .. noop},
+        DEBUGSTRING => DecodedOp {read_reg1: StackIn0, alu_code:DebugString, .. noop},
+        DEBUGBUFFER => DecodedOp {read_reg1: StackIn0, read_reg2: StackIn1, alu_code:DebugBuffer, .. noop},
     }
 }
 
@@ -318,6 +327,9 @@ fn alu_byte(a : &AluCode) -> u8 {
         /* type, sz, ext : 4 * 3 * 2 = 24 */
         FixMemory {ref mtype, ref memsize, ref packing} => (0xc0 | (type_code(mtype) << 4) | size_code(mtype, memsize, packing)),
         Normal(x) => x,
+        DebugInt => 0x09,
+        DebugString => 0x0a,
+        DebugBuffer => 0x0b,
     }
 }
 
@@ -519,7 +531,7 @@ fn adjust_stack(res : &mut Vec<Inst>, diff : u32, num : u32) {
 
 fn is_func(e : &External) -> bool {
     match *e {
-        External::Function(idx) => {
+        External::Function(_idx) => {
             true
         },
         _ => false
@@ -632,7 +644,7 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
     eprintln!("Got function with {:?} ops, {:?} locals, {} params, {} rets",
         func.code().elements().len(), count_locals(func), ftype.params().len(), rets);
     // Push default values
-    for i in 0..(count_locals(func) as usize) {
+    for _i in 0..(count_locals(func) as usize) {
         eprintln!("pushing default");
         res.push(PUSH(0));
     }
@@ -654,13 +666,12 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
                 label = label + 1;
                 bptr = bptr + 1;
                 let rets = block_len(&bt);
-                stack.push(Control {level: ptr, rets: 0, target: start_label, luuppi: true, .. def});
+                stack.push(Control {level: ptr, rets: rets, target: start_label, luuppi: true, .. def});
                 res.push(LABEL(start_label));
             },
             End => {
                 if stack.len() == 0 { break; }
                 let c : Control = stack.pop().unwrap();
-                ptr = c.level;
                 bptr = bptr - 1;
                 if c.ite {
                     if c.else_label != 0 {
@@ -670,8 +681,12 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
                         res.push(NOP);
                     }
                 }
-                if (!c.luuppi) {
+                if !c.luuppi {
                     res.push(LABEL(c.target));
+                    ptr = c.level;
+                }
+                else {
+                    ptr = c.level + c.rets;
                 }
             },
             If(bt) => {
@@ -679,7 +694,7 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
                 bptr = bptr + 1;
                 let else_label = label;
                 let end_label = label+1;
-                // let rets = block_len(&bt);
+                let rets = block_len(&bt);
                 // eprintln!("Level if {}", ptr);
                 stack.push(Control {level: ptr, rets: rets, target: end_label, else_label, ite: true, .. def});
                 label = label+2;
@@ -961,7 +976,7 @@ fn handle_function(m : &Module, func : &FuncBody, idx : usize) -> Vec<Inst> {
             I32Xor => { ptr = ptr - 1; res.push(BINOP(0x73)); },
             I32Shl => { ptr = ptr - 1; res.push(BINOP(0x74)); },
             I32ShrS => { ptr = ptr - 1; res.push(BINOP(0x75)); },
-            I32ShrU => { ptr = ptr - 1; res.push(BINOP(0x75)); },
+            I32ShrU => { ptr = ptr - 1; res.push(BINOP(0x76)); },
             I32Rotl => { ptr = ptr - 1; res.push(BINOP(0x77)); },
             I32Rotr => { ptr = ptr - 1; res.push(BINOP(0x78)); },
 
@@ -1081,7 +1096,7 @@ fn resolve_func_labels(arr : &Vec<Inst>, n : usize) -> Vec<Inst> {
         }).collect::<Vec<Inst>>()
 }
 
-fn init_value(m : &Module, expr : &InitExpr) -> u64 {
+fn init_value(_m : &Module, expr : &InitExpr) -> u64 {
     eprintln!("init {:?}", expr);
     match expr.code()[0] {
       I32Const(a) => a as u64,
@@ -1122,6 +1137,9 @@ fn simple_call(m : &Module, res : &mut Vec<Inst>, name : &str) {
     if let Some(f) = find_function(m, name) {
         eprintln!("Found function {}: {}", name, f);
         res.push(CALL(f));
+    }
+    else {
+        eprintln!("Warning: cannot find function {}", name);
     }
 }
 
@@ -1174,7 +1192,7 @@ fn main() {
     if let Some(sec) = module.elements_section() {
         let mut count = 0;
         for els in sec.entries().iter() {
-            for el in els.members().iter() {
+            for _el in els.members().iter() {
                 res.push(NOP);
                 res.push(NOP);
                 res.push(NOP);
@@ -1241,6 +1259,7 @@ fn main() {
     res.push(PUSH(0));
 
     simple_call(&module, &mut res, "_main");
+    simple_call(&module, &mut res, "_finalizeSystem");
     res.push(EXIT);
 
     // handle imports
@@ -1252,11 +1271,11 @@ fn main() {
                 res.push(RETURN);
             }
             else if f.field() == "_inputSize" {
-                res.push(INPUTNAME);
+                res.push(INPUTSIZE);
                 res.push(RETURN);
             }
             else if f.field() == "_inputData" {
-                res.push(INPUTNAME);
+                res.push(INPUTDATA);
                 res.push(RETURN);
             }
             else if f.field() == "_outputName" {
@@ -1272,7 +1291,7 @@ fn main() {
                 res.push(RETURN);
             }
             else if f.field().starts_with("_invoke") {
-                let mut str : String = "_dynCall_".to_owned() + &f.field()[7..];
+                let mut str : String = "_dynCall".to_owned() + &f.field()[7..];
                 simple_call(&module, &mut res, &str);
                 res.push(RETURN);
             }
@@ -1280,8 +1299,8 @@ fn main() {
                 res.push(UNREACHABLE);
             }
             else if f.field() == "_sbrk" {
-                let offset = 1024;
-                let topptr = find_global(&module, "_system_ptr").unwrap();
+                let offset = 0;
+                let topptr = find_global(&module, "DYNAMICTOP_PTR").unwrap();
                 res.push(STUB(String::from("sbrk")));
                 res.push(LOADGLOBAL(topptr));
                 res.push(LOAD {memsize: Size::Mem32, packing:Packing::ZX, mtype:ValueType::I32, offset});
@@ -1304,15 +1323,16 @@ fn main() {
                 res.push(RETURN);
             }
             else if f.field() == "_debugString" {
-                res.push(STUB(String::from("env._debugString")));
+                res.push(DEBUGSTRING);
                 res.push(RETURN);
             }
             else if f.field() == "_debugInt" {
+                res.push(DEBUGINT);
                 res.push(STUB(String::from("env._debugInt")));
                 res.push(RETURN);
             }
             else if f.field() == "_debugBuffer" {
-                res.push(STUB(String::from("env._debugBuffer")));
+                res.push(DEBUGBUFFER);
                 res.push(DROP(1));
                 res.push(RETURN);
             }
@@ -1381,13 +1401,16 @@ fn main() {
     }).collect::<Vec<Inst>>();
     
     let mut f = File::create("test.micro").expect("Unable to create file");
+    
+    let mut idx = 0;
 
     for i in res.iter() {
         let op = decode(i);
         let w = code_word(&op);
         f.write_all(&w).expect("Unable to write data");
-        eprintln!("{:?}: {}", i, code_str(&w));
-        println!("{}", code_str(&w));
+        eprintln!("At {} {:?}: {}", idx, i, code_str(&w));
+        // println!("{}", code_str(&w));
+        idx = idx + 1;
     }
 
 }
